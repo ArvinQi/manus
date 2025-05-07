@@ -1,0 +1,23 @@
+# 构建输出
+dist/
+
+# 依赖
+node_modules/
+
+# 包锁文件
+package-lock.json
+yarn.lock
+
+# 覆盖率报告
+coverage/
+
+# 环境变量文件
+.env
+.env.*
+
+# 日志文件
+*.log
+
+# 编辑器配置
+.vscode/
+.idea/

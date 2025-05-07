@@ -1,0 +1,52 @@
+# Manus 配置示例文件
+# 复制此文件到 config.toml 并修改为你的配置
+
+# LLM 模型配置
+[llm.default]
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+max_tokens = 4096
+temperature = 1.0
+api_type = "openai"
+api_version = ""
+
+# LLM 模型配置
+[llm.coder]
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+max_tokens = 4096
+temperature = 1.0
+api_type = "openai"
+api_version = ""
+
+# 可选的视觉模型配置
+[llm.vision]
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-..."
+max_tokens = 4096
+temperature = 1.0
+api_type = "openai"
+api_version = ""
+
+# 浏览器配置
+[browser]
+headless = false
+disable_security = true
+extra_args = []
+max_content_length = 2000
+
+# 搜索配置
+[search]
+engine = "Google"
+fallback_engines = ["DuckDuckGo", "Bing"]
+retry_delay = 60
+max_retries = 3
+lang = "zh"
+country = "cn"
+
+# 工作空间配置
+[workspace]
+root = "./workspace"
