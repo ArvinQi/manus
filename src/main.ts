@@ -8,6 +8,9 @@ import { Manus } from './agent/manus.js';
 import { Logger } from './utils/logger.js';
 import * as readline from 'readline';
 
+// 增加process对象的最大监听器数量，避免内存泄漏警告
+process.setMaxListeners(15);
+
 // 创建日志记录器
 const logger = new Logger('Main');
 
@@ -20,7 +23,7 @@ export async function main() {
 
   try {
     // 获取用户输入
-    const prompt = process.argv[2] || (await getUserInput('请输入你的指令: '));
+    const prompt = process.argv[2] || (await getUserInput('请输入你的指令: \n'));
 
     if (!prompt.trim()) {
       logger.warning('提供了空指令。');
@@ -42,16 +45,17 @@ export async function main() {
  * 获取用户输入
  * @param question 提示问题
  */
-function getUserInput(question: string): Promise<string> {
+async function getUserInput(question: string): Promise<string> {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
   });
 
+
   return new Promise((resolve) => {
     rl.question(question, (answer: string) => {
-      rl.close();
       resolve(answer);
+      rl.close();
     });
   });
 }
