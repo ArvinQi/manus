@@ -1,6 +1,7 @@
 /**
  * PlanningAgent 类
  * 负责任务规划、记录和动态管理
+ * 支持planning工具功能
  */
 import fs from 'fs';
 import path from 'path';
@@ -8,16 +9,44 @@ import path from 'path';
 interface PlanStep {
   description: string;
   status: 'pending' | 'done';
+  details?: string;
 }
 
 export class PlanningAgent {
   private plan: PlanStep[] = [];
   private planFile: string;
   private currentStepIndex: number = 0;
+  private planningTools: Record<string, Function> = {};
 
   constructor(planFilePath: string) {
     this.planFile = planFilePath;
     this.loadPlan();
+    this.initPlanningTools();
+  }
+
+  /**
+   * 初始化规划工具
+   * 提供类似Python版本的planning工具功能
+   */
+  private initPlanningTools() {
+    this.planningTools = {
+      create: (steps: string[]) => this.initPlan(steps),
+      update: (index: number, description: string) => this.updateStep(index, description),
+      mark_step: (index: number) => this.markStepDone(index),
+      add_step: (description: string) => this.addStep(description),
+      insert_step: (index: number, description: string) => this.insertPriorityStep(description, index),
+      get_plan: () => this.getPlan(),
+      get_current_step: () => this.getCurrentStep(),
+      get_current_index: () => this.getCurrentStepIndex()
+    };
+  }
+
+  /**
+   * 获取规划工具
+   * @returns 规划工具集合
+   */
+  getPlanningTools() {
+    return this.planningTools;
   }
 
   /**
@@ -26,7 +55,9 @@ export class PlanningAgent {
    */
   initPlan(steps: string[]) {
     this.plan = steps.map((desc) => ({ description: desc, status: 'pending' }));
+    this.currentStepIndex = 0;
     this.savePlan();
+    return { success: true, message: '计划已初始化', plan: this.plan };
   }
 
   /**
@@ -37,6 +68,25 @@ export class PlanningAgent {
     if (this.plan[index]) {
       this.plan[index].status = 'done';
       this.savePlan();
+
+      // 更新当前步骤索引到下一个待处理步骤
+      this.updateCurrentStepIndex();
+
+      return { success: true, message: '步骤已标记为完成', step: this.plan[index] };
+    }
+    return { success: false, message: '步骤索引无效' };
+  }
+
+  /**
+   * 更新当前步骤索引
+   * 找到第一个待处理的步骤
+   */
+  private updateCurrentStepIndex() {
+    const pendingIndex = this.plan.findIndex(step => step.status === 'pending');
+    if (pendingIndex !== -1) {
+      this.currentStepIndex = pendingIndex;
+    } else {
+      // 如果没有待处理步骤，保持当前索引
     }
   }
 
@@ -47,6 +97,28 @@ export class PlanningAgent {
   addStep(desc: string) {
     this.plan.push({ description: desc, status: 'pending' });
     this.savePlan();
+    return { success: true, message: '步骤已添加', step: this.plan[this.plan.length - 1] };
+  }
+
+  /**
+   * 更新步骤描述
+   * @param index 步骤索引
+   * @param description 新的描述
+   */
+  updateStep(index: number, description: string) {
+    if (this.plan[index]) {
+      this.plan[index].description = description;
+      this.savePlan();
+      return { success: true, message: '步骤已更新', step: this.plan[index] };
+    }
+    return { success: false, message: '步骤索引无效' };
+  }
+
+  /**
+   * 获取当前步骤
+   */
+  getCurrentStep() {
+    return this.plan[this.currentStepIndex];
   }
 
   /**
@@ -73,6 +145,7 @@ export class PlanningAgent {
     const insertIndex = index !== undefined ? index : this.currentStepIndex + 1;
     this.plan.splice(insertIndex, 0, { description: desc, status: 'pending' });
     this.savePlan();
+    return { success: true, message: '优先步骤已插入', step: this.plan[insertIndex] };
   }
 
   private generateTechnicalDetails(step: PlanStep) {

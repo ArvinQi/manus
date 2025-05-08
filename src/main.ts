@@ -5,8 +5,11 @@
  */
 
 import { Manus } from './agent/manus.js';
+import { PlanningAgent } from './agent/planning.js';
+import { FlowFactory, FlowType } from './flow/flow_factory.js';
 import { Logger } from './utils/logger.js';
 import * as readline from 'readline';
+import path from 'path';
 
 // 增加process对象的最大监听器数量，避免内存泄漏警告
 process.setMaxListeners(15);
@@ -18,8 +21,10 @@ const logger = new Logger('Main');
  * 主函数
  */
 export async function main() {
-  // 创建并初始化 Manus 代理
-  const agent = await Manus.create();
+  // 创建并初始化代理
+  const agents: Record<string, any> = {
+    'manus': await Manus.create()
+  };
 
   // 等待1秒
   if (!process.argv[2]) {
@@ -36,13 +41,42 @@ export async function main() {
     }
 
     logger.warning('正在处理你的请求...');
-    await agent.run(prompt);
-    logger.info('请求处理完成。');
-  } catch (error) {
-    logger.error(`操作出错: ${error}`);
+
+
+    // 使用流程工厂创建规划流程
+    const flow = FlowFactory.createFlow({
+      flowType: FlowType.PLANNING,
+      agents: agents
+    });
+
+    try {
+      // 记录开始时间
+      const startTime = Date.now();
+
+      // 执行流程
+      const result = await flow.execute(prompt);
+
+      // 计算耗时
+      const elapsedTime = (Date.now() - startTime) / 1000;
+      logger.info(`请求处理完成，耗时 ${elapsedTime.toFixed(2)} 秒`);
+      logger.info(result);
+    } catch (error) {
+      logger.error('请求处理超时');
+      logger.info('由于超时，操作已终止。请尝试一个更简单的请求。');
+    }
+  } catch (error: any) {
+    if (error.name === 'KeyboardInterrupt') {
+      logger.info('操作被用户取消。');
+    } else {
+      logger.error(`操作出错: ${error}`);
+    }
   } finally {
-    // 确保在退出前清理代理资源
-    await agent.cleanup();
+    // 清理代理资源
+    for (const agentName in agents) {
+      if (typeof agents[agentName].cleanup === 'function') {
+        await agents[agentName].cleanup();
+      }
+    }
   }
 }
 
