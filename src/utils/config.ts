@@ -18,7 +18,7 @@ function getProjectRoot(): string {
 
 // 项目根目录和工作空间根目录
 const PROJECT_ROOT = getProjectRoot();
-const WORKSPACE_ROOT = path.join(PROJECT_ROOT, 'workspace');
+const WORKSPACE_ROOT = PROJECT_ROOT; // path.join(PROJECT_ROOT, 'workspace');
 
 // LLM 设置接口
 interface LLMSettings {
@@ -153,8 +153,8 @@ export class Config {
       }
 
       // 加载工作空间配置
-      if (rawConfig.workspace?.root) {
-        this.config.workspace_root = rawConfig.workspace.root;
+      if (typeof rawConfig.workspace === 'object' && rawConfig.workspace && 'root' in rawConfig.workspace) {
+        this.config.workspace_root = (rawConfig.workspace as Record<string, string>).root;
       }
 
       this.logger.info('配置加载成功');

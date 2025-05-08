@@ -4,7 +4,7 @@
  */
 
 import { ReActAgent } from './react.js';
-import { AgentState, Memory, Message } from '../schema/index.js';
+import { AgentState, Memory, Message, Role } from '../schema/index.js';
 import { LLM } from '../llm/index.js';
 import { Logger } from '../utils/logger.js';
 import { ToolCollection } from '../tool/tool_collection.js';
@@ -52,11 +52,12 @@ interface CoderAgentConfig {
  * 实现智能编码能力，使用 Codex 完成编码工作
  */
 export class CoderAgent extends ReActAgent {
-  private logger = new Logger('CoderAgent');
+  protected logger = new Logger('CoderAgent');
   private config: CoderAgentConfig;
   private records: CodexRecord[] = [];
   private bashTool: BashTool;
   private fileOps: FileOperatorsTool;
+  private toolCollection: ToolCollection;
 
   /**
    * 构造函数
@@ -65,7 +66,12 @@ export class CoderAgent extends ReActAgent {
    * @param config 配置
    */
   constructor(llm: LLM, tools: ToolCollection, config: CoderAgentConfig = {}) {
-    super(llm, tools);
+    super({
+      name: 'CoderAgent',
+      description: '智能编码助手',
+      systemPrompt: '你是一个专业的编程助手，可以帮助用户完成各种编码任务。',
+      maxSteps: 10
+    });
 
     // 默认配置
     this.config = {
@@ -77,6 +83,9 @@ export class CoderAgent extends ReActAgent {
       evaluationPrompt: '评估以下代码的质量、正确性和效率。给出 0-100 的评分和详细反馈。', // 默认评估提示词
       ...config,
     };
+
+    // 保存工具集合
+    this.toolCollection = tools;
 
     // 获取必要的工具
     this.bashTool = this.findTool(BashTool) as BashTool;
@@ -92,7 +101,7 @@ export class CoderAgent extends ReActAgent {
    * @returns 工具实例或 undefined
    */
   private findTool<T extends BaseTool>(toolType: new (...args: any[]) => T): T | undefined {
-    for (const tool of this.tools.tools) {
+    for (const tool of this.toolCollection.tools) {
       if (tool instanceof toolType) {
         return tool as T;
       }
@@ -209,21 +218,22 @@ export class CoderAgent extends ReActAgent {
       // 使用 LLM 评估代码
       const prompt = `${this.config.evaluationPrompt}\n\n任务: ${task}\n\n代码:\n${code}`;
 
-      const messages: Message[] = [
+      const messages = [
         {
-          role: 'system',
+          role: Role.SYSTEM,
           content: '你是一个专业的代码评估专家，擅长评估代码质量、正确性和效率。',
         },
         {
-          role: 'user',
+          role: Role.USER,
           content: prompt,
         },
       ];
 
-      const response = await this.llm.chat(messages);
+      // 使用私有方法的替代方案
+      const result = await (this.llm as any).sendRequest({ messages });
 
-      // 解析评估结果
-      return this.parseEvaluation(response.content);
+      // 处理可能为null的内容
+      return this.parseEvaluation(result.content || '');
     } catch (error) {
       this.logger.error(`评估代码失败: ${error}`);
       return {

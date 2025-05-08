@@ -3,7 +3,7 @@
  * 提供格式化的日志输出功能
  */
 
-import pino from 'pino';
+import * as pino from 'pino';
 
 export class Logger {
   private logger: pino.Logger;
@@ -11,7 +11,7 @@ export class Logger {
 
   constructor(context: string) {
     this.context = context;
-    this.logger = pino({
+    this.logger = pino.pino({
       transport: {
         target: 'pino-pretty',
         options: {
