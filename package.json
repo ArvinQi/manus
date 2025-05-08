@@ -1,5 +1,5 @@
 {
-  "name": "manus",
+  "name": "@manus/cli",
   "version": "0.1.0",
   "description": "A TypeScript implementation of the Manus agent framework",
   "type": "module",
