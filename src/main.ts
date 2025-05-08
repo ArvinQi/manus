@@ -23,12 +23,12 @@ const logger = new Logger('Main');
 export async function main() {
   // 创建并初始化代理
   const agents: Record<string, any> = {
-    'manus': await Manus.create()
+    manus: await Manus.create(),
   };
 
   // 等待1秒
   if (!process.argv[2]) {
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 
   try {
@@ -42,11 +42,10 @@ export async function main() {
 
     logger.warning('正在处理你的请求...');
 
-
     // 使用流程工厂创建规划流程
     const flow = FlowFactory.createFlow({
       flowType: FlowType.PLANNING,
-      agents: agents
+      agents: agents,
     });
 
     try {
@@ -65,7 +64,7 @@ export async function main() {
       logger.info('由于超时，操作已终止。请尝试一个更简单的请求。');
     }
   } catch (error: any) {
-    if (error.name === 'KeyboardInterrupt') {
+    if (error?.name === 'KeyboardInterrupt') {
       logger.info('操作被用户取消。');
     } else {
       logger.error(`操作出错: ${error}`);
@@ -89,7 +88,6 @@ async function getUserInput(question: string): Promise<string> {
     input: process.stdin,
     output: process.stdout,
   });
-
 
   return new Promise((resolve) => {
     rl.question(question, (answer: string) => {

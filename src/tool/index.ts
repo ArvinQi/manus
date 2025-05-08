@@ -10,5 +10,6 @@ export * from './bash.js';
 export * from './ask_human.js';
 export * from './create_chat_completion.js';
 export * from './file_operators.js';
+export * from './planning.js';
 export * from './str_replace_editor.js';
 export * from './system_info.js';

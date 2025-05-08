@@ -8,6 +8,7 @@ import { Logger } from '../utils/logger.js';
 import { AskHumanTool } from './ask_human.js';
 import { CreateChatCompletionTool } from './create_chat_completion.js';
 import { FileOperatorsTool } from './file_operators.js';
+import { PlanningTool } from './planning.js';
 import { StrReplaceEditorTool } from './str_replace_editor.js';
 import { BashTool } from './bash.js';
 import { SystemInfoTool } from './system_info.js';
@@ -28,6 +29,7 @@ export class ToolCollection {
       new AskHumanTool(),
       new CreateChatCompletionTool(),
       new FileOperatorsTool(),
+      new PlanningTool(),
       new StrReplaceEditorTool(),
       new BashTool(),
       new SystemInfoTool(),

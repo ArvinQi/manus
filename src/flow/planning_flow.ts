@@ -5,38 +5,11 @@
 
 import path from 'path';
 import { Flow } from './flow_factory.js';
-import { PlanningAgent } from '../agent/planning.js';
 import { Logger } from '../utils/logger.js';
+import { PlanningTool } from '../tool/planning.js';
 
-// 规划系统提示词
-const PLANNING_SYSTEM_PROMPT = `
-你是一个专家规划代理，负责通过结构化计划高效解决问题。
-你的工作是：
-1. 分析请求以理解任务范围
-2. 创建一个清晰、可操作的计划，使用 planning 工具取得有意义的进展
-3. 根据需要使用可用工具执行步骤
-4. 跟踪进度并在必要时调整计划
-5. 当任务完成时，立即使用 finish 结束
-
-可用工具将根据任务而变化，但可能包括：
-- planning：创建、更新和跟踪计划（命令：create、update、mark_step 等）
-- finish：任务完成时结束
-
-将任务分解为具有明确结果的逻辑步骤。避免过多的细节或子步骤。
-考虑依赖关系和验证方法。
-知道何时结束 - 一旦目标达成，就不要继续思考。
-`;
-
-// 下一步提示词
-const NEXT_STEP_PROMPT = `
-基于当前状态，你的下一步行动是什么？
-选择最有效的前进路径：
-1. 计划是否足够，或者需要改进？
-2. 你能立即执行下一步吗？
-3. 任务是否完成？如果是，立即使用 finish。
-
-简明扼要地说明你的推理，然后选择适当的工具或行动。
-`;
+// 计划ID常量
+const DEFAULT_PLAN_ID = 'main_task_plan';
 
 /**
  * 规划流程类
@@ -45,7 +18,8 @@ const NEXT_STEP_PROMPT = `
 export class PlanningFlow implements Flow {
   private agents: Record<string, any>;
   private logger: Logger;
-  private planningAgent: PlanningAgent;
+  private planningTool: PlanningTool;
+  private currentPlanId: string;
 
   /**
    * 构造函数
@@ -54,7 +28,8 @@ export class PlanningFlow implements Flow {
   constructor(agents: Record<string, any>) {
     this.agents = agents;
     this.logger = new Logger('PlanningFlow');
-    this.planningAgent = new PlanningAgent(path.join(process.cwd(), 'task_plan.md'));
+    this.planningTool = new PlanningTool();
+    this.currentPlanId = DEFAULT_PLAN_ID;
   }
 
   /**
@@ -73,21 +48,99 @@ export class PlanningFlow implements Flow {
 
     try {
       // 初始化计划
-      this.initializePlan(prompt);
+      await this.initializePlan(prompt);
 
-      // 获取当前步骤索引
-      const currentStepIndex = this.planningAgent.getCurrentStepIndex();
+      // 获取计划详情
+      const planResult = await this.planningTool.run({
+        command: 'get',
+        plan_id: this.currentPlanId,
+      });
+
+      if (planResult.error) {
+        throw new Error(`获取计划失败: ${planResult.error}`);
+      }
+
+      // 确保输出存在
+      if (!planResult.output) {
+        throw new Error('获取计划失败: 没有返回计划数据');
+      }
+
+      // 从 planningTool 获取计划详情
+      // 由于 _formatPlan 返回的是格式化文本而不是 JSON，我们需要直接获取计划数据
+      const planId = this.currentPlanId;
+      const plan = (this.planningTool as any).plans[planId];
+      
+      if (!plan) {
+        throw new Error(`找不到计划: ${planId}`);
+      }
+      
+      // 找到第一个未开始或进行中的步骤
+      const currentStepIndex = plan.step_statuses.findIndex(
+        (status: string) => status === 'not_started' || status === 'in_progress'
+      );
+
+      if (currentStepIndex === -1) {
+        return '所有计划步骤已完成';
+      }
+
+      // 标记当前步骤为进行中
+      await this.planningTool.run({
+        command: 'mark_step',
+        plan_id: this.currentPlanId,
+        step_index: currentStepIndex,
+        step_status: 'in_progress',
+        step_notes: '正在执行...',
+      });
 
       try {
         // 执行代理
         await manus.run(prompt);
 
         // 标记当前步骤为完成
-        this.planningAgent.markStepDone(currentStepIndex);
+        await this.planningTool.run({
+          command: 'mark_step',
+          plan_id: this.currentPlanId,
+          step_index: currentStepIndex,
+          step_status: 'completed',
+          step_notes: '步骤已完成',
+        });
+
         this.logger.info('当前计划步骤已完成');
       } catch (error) {
         this.logger.error(`执行出错: ${error}`);
-        this.planningAgent.insertPriorityStep('处理执行异常');
+
+        // 标记当前步骤为阻塞
+        await this.planningTool.run({
+          command: 'mark_step',
+          plan_id: this.currentPlanId,
+          step_index: currentStepIndex,
+          step_status: 'blocked',
+          step_notes: `执行出错: ${error.message}`,
+        });
+
+        // 添加处理异常的步骤
+        try {
+          // 确保 plan 和 plan.steps 存在
+          if (plan && Array.isArray(plan.steps)) {
+            await this.planningTool.run({
+              command: 'update',
+              plan_id: this.currentPlanId,
+              steps: [...plan.steps, '处理执行异常']
+            });
+          } else {
+            // 如果 plan 不可用，创建一个新的步骤
+            await this.planningTool.run({
+              command: 'create',
+              plan_id: this.currentPlanId + '_error',
+              title: '错误恢复计划',
+              steps: ['处理执行异常']
+            });
+          }
+        } catch (updateError) {
+          this.logger.error(`添加异常处理步骤失败: ${updateError}`);
+          // 继续抛出原始错误
+        }
+
         throw error;
       }
 
@@ -102,15 +155,27 @@ export class PlanningFlow implements Flow {
    * 初始化计划
    * @param prompt 用户输入的提示词
    */
-  private initializePlan(prompt: string) {
-    // 如果计划为空，则初始化一个基本计划
-    if (this.planningAgent.getPlan().length === 0) {
-      this.planningAgent.initPlan([
-        `解析用户需求: ${prompt}`,
-        '制定开发计划',
-        '执行编码任务',
-        '验证测试结果'
-      ]);
+  private async initializePlan(prompt: string) {
+    // 检查计划是否存在
+    const planResult = await this.planningTool.run({
+      command: 'get',
+      plan_id: this.currentPlanId,
+    });
+
+    // 如果计划不存在，则创建新计划
+    if (planResult.error) {
+      await this.planningTool.run({
+        command: 'create',
+        plan_id: this.currentPlanId,
+        title: `任务计划: ${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}`,
+        steps: [`解析用户需求: ${prompt}`, '制定开发计划', '执行编码任务', '验证测试结果'],
+      });
+
+      // 设置为活动计划
+      await this.planningTool.run({
+        command: 'set_active',
+        plan_id: this.currentPlanId,
+      });
     }
   }
 }
