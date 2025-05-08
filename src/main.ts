@@ -21,6 +21,11 @@ export async function main() {
   // 创建并初始化 Manus 代理
   const agent = await Manus.create();
 
+  // 等待1秒
+  if (!process.argv[2]) {
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
   try {
     // 获取用户输入
     const prompt = process.argv[2] || (await getUserInput('请输入你的指令: \n'));
