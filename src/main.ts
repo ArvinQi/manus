@@ -23,7 +23,7 @@ const logger = new Logger('Main');
 export async function main() {
   // 创建并初始化代理
   const agents: Record<string, any> = {
-    manus: await Manus.create(),
+    manus: await Manus.create({maxSteps: 100}),
   };
 
   // 等待1秒
@@ -43,17 +43,18 @@ export async function main() {
     logger.warning('正在处理你的请求...');
 
     // 使用流程工厂创建规划流程
-    const flow = FlowFactory.createFlow({
-      flowType: FlowType.PLANNING,
-      agents: agents,
-    });
+    // const flow = FlowFactory.createFlow({
+    //   flowType: FlowType.PLANNING,
+    //   agents: agents,
+    // });
 
     try {
       // 记录开始时间
       const startTime = Date.now();
 
       // 执行流程
-      const result = await flow.execute(prompt);
+      // const result = await flow.execute(prompt);
+      const result = await agents.manus.run(prompt);
 
       // 计算耗时
       const elapsedTime = (Date.now() - startTime) / 1000;

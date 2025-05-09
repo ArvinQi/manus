@@ -132,12 +132,12 @@ export class PlanningTool extends BaseTool {
         case 'delete':
           return await this._deletePlan(plan_id);
         default:
-          return {
+          return new ToolResult({
             error: `Unrecognized command: ${command}. Allowed commands are: create, update, list, get, set_active, mark_step, delete`,
-          };
+          });
       }
     } catch (error) {
-      return { error: `Error executing planning tool: ${error.message}` };
+      return new ToolResult({ error: `Error executing planning tool: ${error instanceof Error ? error.message : String(error)}` });
     }
   }
 
@@ -153,23 +153,23 @@ export class PlanningTool extends BaseTool {
     steps: string[] | undefined
   ): Promise<ToolResult> {
     if (!plan_id) {
-      return { error: 'Parameter `plan_id` is required for command: create' };
+      return new ToolResult({ error: 'Parameter `plan_id` is required for command: create' });
     }
 
     if (plan_id in this.plans) {
-      return {
+      return new ToolResult({
         error: `A plan with ID '${plan_id}' already exists. Use 'update' to modify existing plans.`,
-      };
+      });
     }
 
     if (!title) {
-      return { error: 'Parameter `title` is required for command: create' };
+      return new ToolResult({ error: 'Parameter `title` is required for command: create' });
     }
 
     if (!steps || !Array.isArray(steps) || !steps.every((step) => typeof step === 'string')) {
-      return {
+      return new ToolResult({
         error: 'Parameter `steps` must be a non-empty list of strings for command: create',
-      };
+      });
     }
 
     // 创建新计划并初始化步骤状态
@@ -187,9 +187,9 @@ export class PlanningTool extends BaseTool {
     // 保存计划到文件
     await this._savePlansToFile();
 
-    return {
+    return new ToolResult({
       output: `Plan created successfully with ID: ${plan_id}\n\n${this._formatPlan(plan)}`,
-    };
+    });
   }
 
   /**
@@ -204,11 +204,11 @@ export class PlanningTool extends BaseTool {
     steps: string[] | undefined
   ): Promise<ToolResult> {
     if (!plan_id) {
-      return { error: 'Parameter `plan_id` is required for command: update' };
+      return new ToolResult({ error: 'Parameter `plan_id` is required for command: update' });
     }
 
     if (!(plan_id in this.plans)) {
-      return { error: `No plan found with ID: ${plan_id}` };
+      return new ToolResult({ error: `No plan found with ID: ${plan_id}` });
     }
 
     const plan = this.plans[plan_id];
@@ -219,9 +219,9 @@ export class PlanningTool extends BaseTool {
 
     if (steps) {
       if (!Array.isArray(steps) || !steps.every((step) => typeof step === 'string')) {
-        return {
+        return new ToolResult({
           error: 'Parameter `steps` must be a list of strings for command: update',
-        };
+        });
       }
 
       // 保留未更改步骤的现有状态和注释
@@ -252,9 +252,9 @@ export class PlanningTool extends BaseTool {
     // 保存更新后的计划到文件
     await this._savePlansToFile();
 
-    return {
+    return new ToolResult({
       output: `Plan updated successfully: ${plan_id}\n\n${this._formatPlan(plan)}`,
-    };
+    });
   }
 
   /**
@@ -262,9 +262,9 @@ export class PlanningTool extends BaseTool {
    */
   private async _listPlans(): Promise<ToolResult> {
     if (Object.keys(this.plans).length === 0) {
-      return {
+      return new ToolResult({
         output: "No plans available. Create a plan with the 'create' command.",
-      };
+      });
     }
 
     let output = 'Available plans:\n';
@@ -276,7 +276,7 @@ export class PlanningTool extends BaseTool {
       output += `• ${plan_id}${currentMarker}: ${plan.title} - ${progress}\n`;
     }
 
-    return { output };
+    return new ToolResult({ output });
   }
 
   /**
@@ -287,19 +287,19 @@ export class PlanningTool extends BaseTool {
     if (!plan_id) {
       // 如果未提供计划ID，使用当前活动计划
       if (!this._current_plan_id) {
-        return {
+        return new ToolResult({
           error: 'No active plan. Please specify a plan_id or set an active plan.',
-        };
+        });
       }
       plan_id = this._current_plan_id;
     }
 
     if (!(plan_id in this.plans)) {
-      return { error: `No plan found with ID: ${plan_id}` };
+      return new ToolResult({ error: `No plan found with ID: ${plan_id}` });
     }
 
     const plan = this.plans[plan_id];
-    return { output: this._formatPlan(plan) };
+    return new ToolResult({ output: this._formatPlan(plan) });
   }
 
   /**
@@ -308,19 +308,19 @@ export class PlanningTool extends BaseTool {
    */
   private async _setActivePlan(plan_id: string | undefined): Promise<ToolResult> {
     if (!plan_id) {
-      return { error: 'Parameter `plan_id` is required for command: set_active' };
+      return new ToolResult({ error: 'Parameter `plan_id` is required for command: set_active' });
     }
 
     if (!(plan_id in this.plans)) {
-      return { error: `No plan found with ID: ${plan_id}` };
+      return new ToolResult({ error: `No plan found with ID: ${plan_id}` });
     }
 
     this._current_plan_id = plan_id;
-    return {
+    return new ToolResult({
       output: `Plan '${plan_id}' is now the active plan.\n\n${this._formatPlan(
         this.plans[plan_id]
       )}`,
-    };
+    });
   }
 
   /**
@@ -339,36 +339,36 @@ export class PlanningTool extends BaseTool {
     if (!plan_id) {
       // 如果未提供计划ID，使用当前活动计划
       if (!this._current_plan_id) {
-        return {
+        return new ToolResult({
           error: 'No active plan. Please specify a plan_id or set an active plan.',
-        };
+        });
       }
       plan_id = this._current_plan_id;
     }
 
     if (!(plan_id in this.plans)) {
-      return { error: `No plan found with ID: ${plan_id}` };
+      return new ToolResult({ error: `No plan found with ID: ${plan_id}` });
     }
 
     if (step_index === undefined) {
-      return { error: 'Parameter `step_index` is required for command: mark_step' };
+      return new ToolResult({ error: 'Parameter `step_index` is required for command: mark_step' });
     }
 
     const plan = this.plans[plan_id];
 
     if (step_index < 0 || step_index >= plan.steps.length) {
-      return {
+      return new ToolResult({
         error: `Invalid step_index: ${step_index}. Valid indices range from 0 to ${plan.steps.length - 1}.`,
-      };
+      });
     }
 
     if (
       step_status &&
       !['not_started', 'in_progress', 'completed', 'blocked'].includes(step_status)
     ) {
-      return {
+      return new ToolResult({
         error: `Invalid step_status: ${step_status}. Valid statuses are: not_started, in_progress, completed, blocked`,
-      };
+      });
     }
 
     if (step_status) {
@@ -382,9 +382,9 @@ export class PlanningTool extends BaseTool {
     // 保存更新后的计划到文件
     await this._savePlansToFile();
 
-    return {
+    return new ToolResult({
       output: `Step ${step_index} updated in plan '${plan_id}'.\n\n${this._formatPlan(plan)}`,
-    };
+    });
   }
 
   /**
@@ -393,11 +393,11 @@ export class PlanningTool extends BaseTool {
    */
   private async _deletePlan(plan_id: string | undefined): Promise<ToolResult> {
     if (!plan_id) {
-      return { error: 'Parameter `plan_id` is required for command: delete' };
+      return new ToolResult({ error: 'Parameter `plan_id` is required for command: delete' });
     }
 
     if (!(plan_id in this.plans)) {
-      return { error: `No plan found with ID: ${plan_id}` };
+      return new ToolResult({ error: `No plan found with ID: ${plan_id}` });
     }
 
     delete this.plans[plan_id];
@@ -410,7 +410,7 @@ export class PlanningTool extends BaseTool {
     // 保存更新后的计划到文件
     await this._savePlansToFile();
 
-    return { output: `Plan '${plan_id}' has been deleted.` };
+    return new ToolResult({ output: `Plan '${plan_id}' has been deleted.` });
   }
 
   /**
@@ -464,14 +464,42 @@ export class PlanningTool extends BaseTool {
 
   /**
    * 保存计划到文件
+   * @returns ToolResult 包含操作结果或错误信息
    */
-  private async _savePlansToFile(): Promise<void> {
+  private async _savePlansToFile(): Promise<ToolResult> {
     try {
       const plansData = {
         plans: this.plans,
         current_plan_id: this._current_plan_id,
         last_updated: new Date().toISOString(),
       };
+
+      // 确保数据目录存在
+      const dirPath = './data';
+      const dirExistsResult = await this.fileOperator.run({
+        operation: 'exists',
+        path: dirPath,
+      });
+
+      if (dirExistsResult.error) {
+        const errorMsg = `检查数据目录失败: ${dirExistsResult.error}`;
+        this.logger.error(errorMsg);
+        return new ToolResult({ error: errorMsg });
+      }
+
+      // 如果目录不存在，创建它
+      if (!dirExistsResult.output?.exists) {
+        const mkdirResult = await this.fileOperator.run({
+          operation: 'mkdir',
+          path: dirPath,
+        });
+
+        if (mkdirResult.error) {
+          const errorMsg = `创建数据目录失败: ${mkdirResult.error}`;
+          this.logger.error(errorMsg);
+          return new ToolResult({ error: errorMsg });
+        }
+      }
 
       const result = await this.fileOperator.run({
         operation: 'write',
@@ -481,10 +509,16 @@ export class PlanningTool extends BaseTool {
       });
 
       if (result.error) {
-        this.logger.error(`保存计划失败: ${result.error}`);
+        const errorMsg = `保存计划失败: ${result.error}`;
+        this.logger.error(errorMsg);
+        return new ToolResult({ error: errorMsg });
       }
+
+      return new ToolResult({ output: '计划保存成功' });
     } catch (error) {
-      this.logger.error(`保存计划时出错: ${error}`);
+      const errorMsg = `保存计划时出错: ${error instanceof Error ? error.message : String(error)}`;
+      this.logger.error(errorMsg);
+      return new ToolResult({ error: errorMsg });
     }
   }
 

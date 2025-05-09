@@ -60,6 +60,26 @@ export class CoderAgent extends ReActAgent {
   private toolCollection: ToolCollection;
 
   /**
+   * 实现思考过程
+   * @returns 是否需要执行行动
+   */
+  async think(): Promise<boolean> {
+    this.logger.info('CoderAgent 正在思考...');
+    // 这里可以添加更复杂的思考逻辑
+    return true; // 默认需要执行行动
+  }
+
+  /**
+   * 实现行动过程
+   * @returns 行动结果
+   */
+  async act(): Promise<string> {
+    this.logger.info('CoderAgent 正在执行行动...');
+    // 这里可以添加更复杂的行动逻辑
+    return '行动已执行';
+  }
+
+  /**
    * 构造函数
    * @param llm LLM 实例
    * @param tools 工具集合

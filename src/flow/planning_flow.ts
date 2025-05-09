@@ -69,11 +69,11 @@ export class PlanningFlow implements Flow {
       // 由于 _formatPlan 返回的是格式化文本而不是 JSON，我们需要直接获取计划数据
       const planId = this.currentPlanId;
       const plan = (this.planningTool as any).plans[planId];
-      
+
       if (!plan) {
         throw new Error(`找不到计划: ${planId}`);
       }
-      
+
       // 找到第一个未开始或进行中的步骤
       const currentStepIndex = plan.step_statuses.findIndex(
         (status: string) => status === 'not_started' || status === 'in_progress'
@@ -115,7 +115,7 @@ export class PlanningFlow implements Flow {
           plan_id: this.currentPlanId,
           step_index: currentStepIndex,
           step_status: 'blocked',
-          step_notes: `执行出错: ${error.message}`,
+          step_notes: `执行出错: ${error instanceof Error ? error.message : String(error)}`,
         });
 
         // 添加处理异常的步骤
@@ -147,7 +147,7 @@ export class PlanningFlow implements Flow {
       return '流程执行完成';
     } catch (error) {
       this.logger.error(`流程执行失败: ${error}`);
-      return `流程执行失败: ${error.message}`;
+      return `流程执行失败: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
 
@@ -168,7 +168,7 @@ export class PlanningFlow implements Flow {
         command: 'create',
         plan_id: this.currentPlanId,
         title: `任务计划: ${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}`,
-        steps: [`解析用户需求: ${prompt}`, '制定开发计划', '执行编码任务', '验证测试结果'],
+        steps: [`解析用户需求: ${prompt}`, '梳理项目环境', '制定开发计划', '执行编码任务', '验证测试结果'],
       });
 
       // 设置为活动计划
