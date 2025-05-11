@@ -4,10 +4,13 @@
  */
 
 import * as pino from 'pino';
+import * as fs from 'fs';
+import * as path from 'path';
 
 export class Logger {
   private logger: pino.Logger;
   private context: string;
+  private logFilePath: string;
 
   constructor(context: string) {
     this.context = context;
@@ -22,6 +25,12 @@ export class Logger {
       },
       level: process.env.LOG_LEVEL || 'info',
     });
+    // 确保 .manus 目录存在
+    const manusDir = path.resolve(process.cwd(), '.manus');
+    if (!fs.existsSync(manusDir)) {
+      fs.mkdirSync(manusDir);
+    }
+    this.logFilePath = path.join(manusDir, 'logger.log');
   }
 
   /**
@@ -36,6 +45,7 @@ export class Logger {
    */
   info(message: string, ...args: unknown[]): void {
     this.logger.info(this.formatMessage(message), ...args);
+    this.appendLog('INFO', message, args);
   }
 
   /**
@@ -43,6 +53,7 @@ export class Logger {
    */
   warning(message: string, ...args: unknown[]): void {
     this.logger.warn(this.formatMessage(message), ...args);
+    this.appendLog('WARN', message, args);
   }
 
   /**
@@ -50,6 +61,7 @@ export class Logger {
    */
   error(message: string, ...args: unknown[]): void {
     this.logger.error(this.formatMessage(message), ...args);
+    this.appendLog('ERROR', message, args);
   }
 
   /**
@@ -57,5 +69,21 @@ export class Logger {
    */
   debug(message: string, ...args: unknown[]): void {
     this.logger.debug(this.formatMessage(message), ...args);
+    this.appendLog('DEBUG', message, args);
+  }
+
+  private appendLog(level: string, message: string, args: unknown[]): void {
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      level,
+      context: this.context,
+      message,
+      args,
+    };
+    try {
+      fs.appendFileSync(this.logFilePath, JSON.stringify(logEntry) + '\n');
+    } catch (e) {
+      // ignore file write errors
+    }
   }
 }

@@ -23,7 +23,7 @@ const logger = new Logger('Main');
 export async function main() {
   // 创建并初始化代理
   const agents: Record<string, any> = {
-    manus: await Manus.create({maxSteps: 100}),
+    manus: await Manus.create({ maxSteps: 30, useMcpServer: false }),
   };
 
   // 等待1秒

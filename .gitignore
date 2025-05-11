@@ -42,3 +42,6 @@ coverage/
 
 # TypeScript cache
 *.tsbuildinfo
+
+# manus
+.manus

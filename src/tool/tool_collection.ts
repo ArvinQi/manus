@@ -32,7 +32,7 @@ export class ToolCollection {
       new PlanningTool(),
       new StrReplaceEditorTool(),
       new BashTool(),
-      new SystemInfoTool(),
+      // new SystemInfoTool(),
       new Terminate(),
     ];
 

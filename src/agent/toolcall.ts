@@ -148,8 +148,9 @@ export class ToolCallAgent extends ReActAgent {
       if (this.toolChoice === ToolChoice.REQUIRED) {
         throw new Error(TOOL_CALL_REQUIRED);
       }
-
-      // 如果没有工具调用，返回最后一条消息内容
+      // 如果没有工具调用，直接终止执行
+      this.state = AgentState.FINISHED;
+      this.logger.info(`工具未选择，终止执行`);
       return this.messages[this.messages.length - 1].content || '没有内容或命令可执行';
     }
 
@@ -181,26 +182,56 @@ export class ToolCallAgent extends ReActAgent {
    * 执行单个工具调用
    * @param command 工具调用命令
    */
-  private async executeToolCall(command: ToolCall): Promise<string> {
-    if (!command || !command.function || !command.function.name) {
-      return '错误: 无效的命令格式';
+  // protected async executeToolCall(command: ToolCall): Promise<string>;
+  // /**
+  //  * 执行单个工具调用（通过工具名称和参数）
+  //  * @param toolName 工具名称
+  //  * @param args 工具参数
+  //  */
+  // protected async executeToolCall(toolName: string, args: any): Promise<any>;
+  protected async executeToolCall(commandOrName: ToolCall | string, args?: any): Promise<any> {
+    let name: string;
+    let toolArgs: any;
+
+    // 处理不同的调用方式
+    if (typeof commandOrName === 'string') {
+      // 直接使用工具名称和参数
+      name = commandOrName;
+      toolArgs = args || {};
+    } else {
+      // 使用 ToolCall 对象
+      const command = commandOrName;
+      if (!command || !command.function || !command.function.name) {
+        return '错误: 无效的命令格式';
+      }
+
+      name = command.function.name;
+      try {
+        toolArgs = JSON.parse(command.function.arguments || '{}');
+      } catch (error) {
+        return `错误: 无法解析工具参数 - ${error}`;
+      }
     }
 
-    const name = command.function.name;
+    // 检查工具是否存在
     if (!this.availableTools.toolMap[name]) {
       return `错误: 未知工具 '${name}'`;
     }
 
     try {
-      // 解析参数
-      const args = JSON.parse(command.function.arguments || '{}');
-
       // 执行工具
       this.logger.info(`🔧 激活工具: '${name}'...`);
-      const result = await this.availableTools.execute(name, args);
+      const result = await this.availableTools.execute(name, toolArgs);
 
       // 处理特殊工具
       await this.handleSpecialTool(name, result);
+
+      // 如果是直接调用（通过工具名称和参数），返回原始结果
+      if (typeof commandOrName === 'string') {
+        return result;
+      }
+
+      // 以下是通过 ToolCall 对象调用的情况
 
       // 检查结果是否包含 base64 图像
       if (result.base64Image) {

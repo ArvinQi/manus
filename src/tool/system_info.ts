@@ -3,7 +3,7 @@
  * 用于获取系统环境信息，帮助工具根据环境做出决策
  */
 
-import os from 'os';
+import * as os from 'os';
 import { BaseTool, ToolResult } from './base.js';
 import { Logger } from '../utils/logger.js';
 

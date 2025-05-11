@@ -3,8 +3,8 @@
  * 定义工具的基本接口和结果类型
  */
 
-import os from 'os';
-import path from 'path';
+import * as os from 'os';
+import * as path from 'path';
 
 /**
  * 工具基类

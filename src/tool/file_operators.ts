@@ -3,8 +3,8 @@
  * 用于读取、写入和列出文件等操作
  */
 
-import fs from 'fs';
-import path from 'path';
+import * as fs from 'fs';
+import * as path from 'path';
 import { promisify } from 'util';
 import { BaseTool, ToolResult } from './base.js';
 import { Logger } from '../utils/logger.js';

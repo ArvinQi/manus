@@ -573,6 +573,6 @@ export class PlanningTool extends BaseTool {
    * 获取计划文件路径
    */
   private _getPlansFilePath(): string {
-    return './data/plans.json';
+    return './.manus/plans.json';
   }
 }

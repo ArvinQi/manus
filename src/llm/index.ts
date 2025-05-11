@@ -12,6 +12,7 @@ import { Logger } from '../utils/logger.js';
 interface LLMResponse {
   content: string | null;
   tool_calls?: any[];
+  usage?: any;
 }
 
 /**
@@ -86,9 +87,45 @@ export class LLM {
 
       // 处理响应
       const choice = response.choices[0];
+      // 记录任务执行日志到 .manus 目录，采用 JSON 行格式
+      try {
+        const fs = await import('fs');
+        const logPath = './.manus/task_log.jsonl';
+        const logObj = {
+          timestamp: new Date().toISOString(),
+          model: llmConfig.model,
+          messages: allMessages,
+          response: {
+            content: choice.message.content,
+            tool_calls: choice.message.tool_calls,
+            usage: response.usage,
+          },
+        };
+        fs.promises.appendFile(logPath, JSON.stringify(logObj) + '\n', 'utf-8');
+      } catch (e) {
+        this.logger.error(`记录任务执行日志失败: ${e}`);
+      }
+      // 记录 token 消耗到 .manus 目录，采用 JSON 行格式
+      if (response.usage) {
+        try {
+          const fs = await import('fs');
+          const path = './.manus/token_usage.jsonl';
+          const logObj = {
+            timestamp: new Date().toISOString(),
+            model: llmConfig.model,
+            prompt_tokens: response.usage.prompt_tokens,
+            completion_tokens: response.usage.completion_tokens,
+            total_tokens: response.usage.total_tokens,
+          };
+          fs.promises.appendFile(path, JSON.stringify(logObj) + '\n', 'utf-8');
+        } catch (e) {
+          this.logger.error(`记录 token 消耗失败: ${e}`);
+        }
+      }
       return {
         content: choice.message.content,
         tool_calls: choice.message.tool_calls,
+        usage: response.usage,
       };
     } catch (error) {
       this.logger.error(`LLM 请求失败: ${error}`);
