@@ -106,6 +106,11 @@ export class PlanningTool extends BaseTool {
     });
     this.fileOperator = new FileOperatorsTool();
     this.logger = new Logger('PlanningTool');
+
+    // 初始化时自动加载计划文件，支持从中断任务中恢复
+    this.loadPlansFromFile().catch((error) => {
+      this.logger.error(`初始化时加载计划失败: ${error}`);
+    });
   }
 
   /**
@@ -137,7 +142,9 @@ export class PlanningTool extends BaseTool {
           });
       }
     } catch (error) {
-      return new ToolResult({ error: `Error executing planning tool: ${error instanceof Error ? error.message : String(error)}` });
+      return new ToolResult({
+        error: `Error executing planning tool: ${error instanceof Error ? error.message : String(error)}`,
+      });
     }
   }
 
@@ -474,32 +481,8 @@ export class PlanningTool extends BaseTool {
         last_updated: new Date().toISOString(),
       };
 
-      // 确保数据目录存在
-      const dirPath = './data';
-      const dirExistsResult = await this.fileOperator.run({
-        operation: 'exists',
-        path: dirPath,
-      });
-
-      if (dirExistsResult.error) {
-        const errorMsg = `检查数据目录失败: ${dirExistsResult.error}`;
-        this.logger.error(errorMsg);
-        return new ToolResult({ error: errorMsg });
-      }
-
-      // 如果目录不存在，创建它
-      if (!dirExistsResult.output?.exists) {
-        const mkdirResult = await this.fileOperator.run({
-          operation: 'mkdir',
-          path: dirPath,
-        });
-
-        if (mkdirResult.error) {
-          const errorMsg = `创建数据目录失败: ${mkdirResult.error}`;
-          this.logger.error(errorMsg);
-          return new ToolResult({ error: errorMsg });
-        }
-      }
+      // 确保.manus目录存在
+      await this._ensureManusDirExists();
 
       const result = await this.fileOperator.run({
         operation: 'write',
@@ -527,6 +510,9 @@ export class PlanningTool extends BaseTool {
    */
   async loadPlansFromFile(): Promise<void> {
     try {
+      // 确保.manus目录存在
+      await this._ensureManusDirExists();
+
       // 检查文件是否存在
       const existsResult = await this.fileOperator.run({
         operation: 'exists',
@@ -537,6 +523,7 @@ export class PlanningTool extends BaseTool {
         // 如果文件不存在，初始化空计划
         this.plans = {};
         this._current_plan_id = null;
+        this.logger.info('计划文件不存在，初始化空计划');
         return;
       }
 
@@ -549,17 +536,30 @@ export class PlanningTool extends BaseTool {
 
       if (readResult.error) {
         this.logger.error(`读取计划文件失败: ${readResult.error}`);
+        this.plans = {};
+        this._current_plan_id = null;
         return;
       }
 
       // 解析JSON数据
       const content = readResult.output as string;
-      const plansData = JSON.parse(content);
+      try {
+        const plansData = JSON.parse(content);
 
-      // 更新计划数据
-      if (plansData.plans) {
-        this.plans = plansData.plans;
-        this._current_plan_id = plansData.current_plan_id || null;
+        // 更新计划数据
+        if (plansData.plans) {
+          this.plans = plansData.plans;
+          this._current_plan_id = plansData.current_plan_id || null;
+          this.logger.info(`成功从文件恢复了 ${Object.keys(this.plans).length} 个计划`);
+        } else {
+          this.plans = {};
+          this._current_plan_id = null;
+          this.logger.warn('计划文件格式不正确，初始化空计划');
+        }
+      } catch (parseError) {
+        this.logger.error(`解析计划文件失败: ${parseError}`);
+        this.plans = {};
+        this._current_plan_id = null;
       }
     } catch (error) {
       this.logger.error(`加载计划时出错: ${error}`);
@@ -574,5 +574,43 @@ export class PlanningTool extends BaseTool {
    */
   private _getPlansFilePath(): string {
     return './.manus/plans.json';
+  }
+
+  /**
+   * 确保.manus目录存在
+   * 用于初始化时确保存储目录可用
+   */
+  private async _ensureManusDirExists(): Promise<void> {
+    try {
+      const dirPath = './.manus';
+      const dirExistsResult = await this.fileOperator.run({
+        operation: 'exists',
+        path: dirPath,
+      });
+
+      if (dirExistsResult.error) {
+        this.logger.error(`检查.manus目录失败: ${dirExistsResult.error}`);
+        return;
+      }
+
+      // 如果目录不存在，创建它
+      if (!dirExistsResult.output?.exists) {
+        const mkdirResult = await this.fileOperator.run({
+          operation: 'mkdir',
+          path: dirPath,
+        });
+
+        if (mkdirResult.error) {
+          this.logger.error(`创建.manus目录失败: ${mkdirResult.error}`);
+          return;
+        }
+
+        this.logger.info('.manus目录创建成功');
+      }
+    } catch (error) {
+      this.logger.error(
+        `确保.manus目录存在时出错: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 }

@@ -31,6 +31,10 @@ export class ToolCallAgent extends ReActAgent {
   // 当前 base64 图像
   private _currentBase64Image?: string;
 
+  // 消息摘要相关属性
+  private _maxMessagesBeforeSummary: number = 8; // 触发摘要的消息数量阈值
+  private _originalMessages: Message[] = []; // 存储原始消息的备份
+
   constructor(options: {
     name: string;
     description?: string;
@@ -41,6 +45,7 @@ export class ToolCallAgent extends ReActAgent {
     tools?: ToolCollection;
     toolChoice?: ToolChoice;
     specialToolNames?: string[];
+    maxMessagesBeforeSummary?: number; // 触发消息摘要的阈值
   }) {
     super(options);
 
@@ -48,13 +53,184 @@ export class ToolCallAgent extends ReActAgent {
     this.toolChoice = options.toolChoice || ToolChoice.AUTO;
     this.specialToolNames = options.specialToolNames || [];
     this.toolCalls = [];
+
+    // 初始化消息摘要相关配置
+    if (options.maxMessagesBeforeSummary !== undefined) {
+      this._maxMessagesBeforeSummary = options.maxMessagesBeforeSummary;
+    }
   }
 
   /**
    * 思考过程
    * 处理当前状态并使用工具决定下一步行动
    */
+  /**
+   * 对消息进行摘要处理
+   * 当消息数量超过阈值时，将较早的消息进行摘要处理以减少token使用量
+   */
+  /**
+   * 检测重复的用户消息
+   * 识别并过滤掉常见的重复提示，如"请思考下一步应该做什么"
+   * @param messages 需要处理的消息数组
+   * @returns 去除重复后的消息数组
+   */
+  private filterDuplicateMessages(messages: Message[]): Message[] {
+    // 常见的重复提示模式
+    const commonPrompts = [
+      '请思考下一步应该做什么',
+      '请思考下一步',
+      '请继续',
+      '请使用适当的工具',
+      '请使用工具完成任务',
+    ];
+
+    // 记录已经出现过的用户消息内容
+    const seenUserContents = new Set<string>();
+
+    return messages.filter((msg) => {
+      // 只处理用户消息
+      if (msg.role !== 'user') return true;
+
+      const content = msg.content || '';
+
+      // 检查是否是常见提示
+      const isCommonPrompt = commonPrompts.some((prompt) => content.includes(prompt));
+
+      // 如果是常见提示，检查是否已经出现过
+      if (isCommonPrompt) {
+        if (seenUserContents.has(content)) {
+          this.logger.info(
+            `🔍 过滤掉重复的用户提示: "${content.substring(0, 30)}${content.length > 30 ? '...' : ''}"`
+          );
+          return false; // 过滤掉重复的常见提示
+        }
+        seenUserContents.add(content);
+      }
+
+      return true;
+    });
+  }
+
+  /**
+   * 压缩大型消息内容
+   * 对较长的消息内容使用AI提取关键信息
+   * @param content 原始内容
+   * @param maxLength 最大长度阈值
+   * @returns 压缩后的内容
+   */
+  private compressMessageContent(content: string, maxLength: number): string {
+    if (!content || content.length <= maxLength) return content;
+
+    // 对于非常长的内容，进行更智能的压缩
+    if (content.length > maxLength * 3) {
+      // 提取开头和结尾的部分内容
+      const headPart = content.substring(0, maxLength / 2);
+      const tailPart = content.substring(content.length - maxLength / 2);
+
+      // 添加中间省略的提示
+      return `${headPart}\n... [内容过长，已省略${content.length - maxLength}个字符] ...\n${tailPart}`;
+    }
+
+    // 对于中等长度的内容，简单截断
+    return content.substring(0, maxLength) + '...';
+  }
+
+  private summarizeMessages(): void {
+    if (this.messages.length <= this._maxMessagesBeforeSummary) {
+      return; // 消息数量未达到阈值，不需要摘要
+    }
+
+    // 如果已经有原始消息备份，说明已经进行过摘要，不需要重复备份
+    if (this._originalMessages.length === 0) {
+      // 备份原始消息
+      this._originalMessages = [...this.messages];
+    }
+
+    // 保留最近的消息（最后N条，N为阈值）
+    const recentMessages = this.messages.slice(-this._maxMessagesBeforeSummary);
+
+    // 对较早的消息进行摘要
+    let olderMessages = this.messages.slice(0, -this._maxMessagesBeforeSummary);
+
+    // 过滤掉重复的用户提示消息
+    olderMessages = this.filterDuplicateMessages(olderMessages);
+
+    // 如果较早的消息中已经包含摘要消息（以系统消息形式），则需要特殊处理
+    const existingSummaryIndex = olderMessages.findIndex(
+      (msg) => msg.role === 'system' && msg.content && msg.content.startsWith('以下是之前')
+    );
+
+    // 创建摘要消息
+    let summaryContent = '';
+
+    if (existingSummaryIndex >= 0) {
+      // 如果已经有摘要，则合并摘要
+      const otherMessages = olderMessages.filter((_, index) => index !== existingSummaryIndex);
+      summaryContent =
+        `以下是之前 ${this._originalMessages.length - this._maxMessagesBeforeSummary} 条消息的摘要：\n` +
+        otherMessages
+          .map((msg) => {
+            let content = msg.content || '';
+            // 使用智能压缩处理内容
+            content = this.compressMessageContent(content, 100);
+            return `- ${msg.role}: ${content}`;
+          })
+          .join('\n');
+    } else {
+      // 创建新的摘要
+      summaryContent =
+        `以下是之前 ${olderMessages.length} 条消息的摘要：\n` +
+        olderMessages
+          .map((msg) => {
+            let content = msg.content || '';
+            // 使用智能压缩处理内容
+            content = this.compressMessageContent(content, 150);
+
+            // 如果是工具调用消息，添加工具名称
+            if (msg.tool_calls && msg.tool_calls.length > 0) {
+              const toolNames = msg.tool_calls.map((tc) => tc.function.name).join(', ');
+              return `- ${msg.role} [工具: ${toolNames}]: ${content}`;
+            }
+            return `- ${msg.role}: ${content}`;
+          })
+          .join('\n');
+    }
+
+    const summaryMessage = Message.systemMessage(summaryContent);
+
+    // 更新消息列表，用摘要替换较早的消息
+    this.messages = [summaryMessage, ...recentMessages];
+
+    this.logger.info(
+      `🔄 消息已摘要处理：${olderMessages.length} 条消息被摘要为 1 条，保留最近 ${recentMessages.length} 条消息`
+    );
+  }
+
+  /**
+   * 恢复原始消息
+   * 在需要时可以恢复完整的消息历史
+   */
+  /**
+   * 恢复原始消息
+   * 在需要时可以恢复完整的消息历史，并清空原始消息备份
+   * @returns 是否成功恢复原始消息
+   */
+  recallOriginalMessages(): boolean {
+    if (this._originalMessages.length > 0) {
+      this.messages = [...this._originalMessages];
+      this.logger.info(`🔄 已恢复原始消息历史（${this.messages.length} 条消息）`);
+      // 清空原始消息备份，防止重复恢复
+      this._originalMessages = [];
+      return true;
+    }
+    this.logger.warning('⚠️ 没有可恢复的原始消息历史');
+    return false;
+  }
+
   async think(): Promise<boolean> {
+    // 在发送请求前对消息进行摘要处理
+    this.summarizeMessages();
+
     // 如果有下一步提示，添加用户消息
     if (this.nextStepPrompt) {
       const userMsg = Message.userMessage(this.nextStepPrompt);
@@ -172,7 +348,21 @@ export class ToolCallAgent extends ReActAgent {
       });
 
       this.memory.addMessage(toolMsg);
+
+      // 如果存在原始消息备份，也更新原始消息历史
+      // 这确保了在摘要处理后，原始消息历史仍然包含完整的对话
+      if (this._originalMessages.length > 0) {
+        this._originalMessages.push(toolMsg);
+      }
+
       results.push(result);
+    }
+
+    // 检查消息数量是否接近阈值，如果是，提前进行摘要处理
+    // 这有助于在长对话中更积极地控制token使用量
+    if (this.messages.length >= this._maxMessagesBeforeSummary * 2) {
+      this.logger.info(`📝 消息数量(${this.messages.length})已达到阈值的两倍，主动进行摘要处理`);
+      this.summarizeMessages();
     }
 
     return results.join('\n\n');

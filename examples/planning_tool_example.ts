@@ -95,6 +95,6 @@ async function demonstratePlanningTool() {
 }
 
 // 运行示例
-demonstrateplanningTool().catch((error) => {
+demonstratePlanningTool().catch((error) => {
   console.error('示例运行出错:', error);
 });
