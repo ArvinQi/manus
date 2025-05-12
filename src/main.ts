@@ -40,6 +40,7 @@ export async function main() {
       return;
     }
 
+    logger.info('请求内容：' + prompt);
     logger.warning('正在处理你的请求...');
 
     // 使用流程工厂创建规划流程

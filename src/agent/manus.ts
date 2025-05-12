@@ -9,6 +9,8 @@ import { Logger } from '../utils/logger.js';
 import { config } from '../utils/config.js';
 import { ToolCall, ToolChoice } from '../schema/index.js';
 import { spawn } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -94,6 +96,20 @@ export class Manus extends ToolCallAgent {
    * 初始化 Manus 实例
    */
   private async initialize(useMcpServer: boolean = false): Promise<void> {
+    // 检查并备份.manus目录
+    const workspaceRoot = config.getWorkspaceRoot();
+    const manusDir = path.join(workspaceRoot, '.manus');
+
+    if (fs.existsSync(manusDir)) {
+      const backupDir = path.join(workspaceRoot, `.manus_backup_${Date.now()}`);
+      this.logger.info(`发现现有.manus目录，正在备份到 ${backupDir}`);
+      fs.cpSync(manusDir, backupDir, { recursive: true });
+
+      // 清空原目录
+      fs.rmSync(manusDir, { recursive: true, force: true });
+      fs.mkdirSync(manusDir, { recursive: true });
+    }
+
     // 如果使用 MCP Server，则启动服务器并连接客户端
     if (useMcpServer) {
       await this.initializeMcpServer();
