@@ -105,24 +105,30 @@ export class Manus extends ToolCallAgent {
       llmConfigName?: string;
       tools?: ToolCollection;
       useMcpServer?: boolean;
+      continueTask?: boolean; // 新增参数，决定是否继续任务
     } = {}
   ): Promise<Manus> {
     const instance = new Manus(options);
-    await instance.initialize(options.useMcpServer);
+    await instance.initialize(options.useMcpServer, options.continueTask);
     return instance;
   }
 
   /**
    * 初始化 Manus 实例
    */
-  private async initialize(useMcpServer: boolean = false): Promise<void> {
+  private async initialize(
+    useMcpServer: boolean = false,
+    continueTask: boolean = false
+  ): Promise<void> {
     // 检查.manus目录
     const workspaceRoot = config.getWorkspaceRoot();
     const manusDir = path.join(workspaceRoot, '.manus');
 
     if (fs.existsSync(manusDir)) {
       // 尝试恢复任务状态
-      this.loadTaskState();
+      if (continueTask) {
+        this.loadTaskState();
+      }
 
       // 检查是否处于继续任务状态
       const isContinuingTask = this._taskState.isTaskActive && this._taskState.currentTask;

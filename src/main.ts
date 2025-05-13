@@ -21,9 +21,13 @@ const logger = new Logger('Main');
  * 主函数
  */
 export async function main() {
+  const continueTask = process.argv.includes('--continue');
+  const useMcpServer = process.argv.includes('--use-mcp-server');
+  const maxSteps = parseInt(process.argv[3], 10) || 30;
+
   // 创建并初始化代理
   const agents: Record<string, any> = {
-    manus: await Manus.create({ maxSteps: 30, useMcpServer: false }),
+    manus: await Manus.create({ maxSteps, useMcpServer, continueTask }),
   };
 
   // 等待1秒
