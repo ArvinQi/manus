@@ -14,8 +14,8 @@ import { SystemInfoTool } from '../tool/system_info.js';
 import { Terminate } from '../tool/terminate.js';
 // import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
-// 创建日志记录器
-const logger = new Logger('MCPServer');
+// 创建日志记录器 - 禁用控制台输出，只写入到文件
+const logger = new Logger('MCPServer', { useConsole: true });
 
 // 创建 MCP Server
 const server = new McpServer({ name: 'manus', version: '1.0.0' });

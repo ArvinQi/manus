@@ -175,6 +175,7 @@ export class Manus extends ToolCallAgent {
       const transport = new StdioClientTransport({
         command: 'node',
         args: ['dist/mcp/server.js'],
+        stderr: 'ignore',
       });
 
       // 创建 MCP 客户端
@@ -524,6 +525,7 @@ export class Manus extends ToolCallAgent {
 
       // 读取并解析状态文件
       const stateData = JSON.parse(fs.readFileSync(taskStateFile, 'utf-8'));
+        this._taskState.currentTask = stateData.currentTask || '';
 
       // 检查数据有效性和时间戳
       const maxAgeMs = 24 * 60 * 60 * 1000; // 24小时
@@ -623,6 +625,12 @@ export class Manus extends ToolCallAgent {
         const result = await this.mcpClient.callTool({
           name: toolName,
           arguments: toolArgs,
+          context: {
+            task: this._taskState.currentTask
+              ? this._taskState.currentTask.substring(0, 200)
+              : 'default_task',
+            step: this._taskState.currentStepIndex ?? -1,
+          },
         });
 
         // 如果是直接调用（通过工具名称和参数），返回处理后的结果
