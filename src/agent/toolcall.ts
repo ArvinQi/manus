@@ -229,7 +229,7 @@ export class ToolCallAgent extends ReActAgent {
 
   async think(): Promise<boolean> {
     // 在发送请求前对消息进行摘要处理
-    this.summarizeMessages();
+    // this.summarizeMessages();
 
     // 如果有下一步提示，添加用户消息
     if (this.nextStepPrompt) {
@@ -360,10 +360,10 @@ export class ToolCallAgent extends ReActAgent {
 
     // 检查消息数量是否接近阈值，如果是，提前进行摘要处理
     // 这有助于在长对话中更积极地控制token使用量
-    if (this.messages.length >= this._maxMessagesBeforeSummary * 2) {
-      this.logger.info(`📝 消息数量(${this.messages.length})已达到阈值的两倍，主动进行摘要处理`);
-      this.summarizeMessages();
-    }
+    // if (this.messages.length >= this._maxMessagesBeforeSummary * 2) {
+    //   this.logger.info(`📝 消息数量(${this.messages.length})已达到阈值的两倍，主动进行摘要处理`);
+    //   this.summarizeMessages();
+    // }
 
     return results.join('\n\n');
   }

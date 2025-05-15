@@ -15,6 +15,7 @@ import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
+import { BaseTool } from '../tool/base.js';
 
 // 系统提示词
 const SYSTEM_PROMPT = `你是一个功能强大的智能助手，可以帮助用户完成各种任务。
@@ -156,7 +157,7 @@ export class Manus extends ToolCallAgent {
     }
 
     // 启动定期保存任务状态的功能
-    this.scheduleTaskStateSaving();
+    // this.scheduleTaskStateSaving();
 
     this._initialized = true;
     this.logger.info('Manus 代理已初始化');
@@ -175,7 +176,7 @@ export class Manus extends ToolCallAgent {
       const transport = new StdioClientTransport({
         command: 'node',
         args: ['dist/mcp/server.js'],
-        stderr: 'ignore',
+        stderr: 'inherit',
       });
 
       // 创建 MCP 客户端
@@ -198,7 +199,14 @@ export class Manus extends ToolCallAgent {
         { method: 'tools/list', params: {} },
         z.object({ tools: z.array(z.any()) })
       );
-      const tools = toolsResult.tools || [];
+
+      const tools = toolsResult.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.inputSchema.description || '',
+        parameters: tool.inputSchema,
+      }));
+
+      // this.availableTools = new ToolCollection(...tools);
       this.logger.info(
         `已连接到 MCP 服务器，可用工具: ${tools.map((t: any) => t.name).join(', ')}`
       );
@@ -525,7 +533,7 @@ export class Manus extends ToolCallAgent {
 
       // 读取并解析状态文件
       const stateData = JSON.parse(fs.readFileSync(taskStateFile, 'utf-8'));
-        this._taskState.currentTask = stateData.currentTask || '';
+      this._taskState.currentTask = stateData.currentTask || '';
 
       // 检查数据有效性和时间戳
       const maxAgeMs = 24 * 60 * 60 * 1000; // 24小时
@@ -582,9 +590,11 @@ export class Manus extends ToolCallAgent {
     // 每10秒保存一次任务状态
     const saveInterval = 10 * 1000;
 
-    setInterval(() => {
+    const intervalId = setInterval(() => {
       if (this._taskState.isTaskActive) {
         this.saveTaskState();
+      } else {
+        clearInterval(intervalId);
       }
     }, saveInterval);
   }
@@ -668,7 +678,7 @@ export class Manus extends ToolCallAgent {
    */
   async cleanup(): Promise<void> {
     // 保存当前任务状态
-    this.saveTaskState();
+    // this.saveTaskState();
 
     // 清理 MCP 资源
     if (this.mcpClient) {

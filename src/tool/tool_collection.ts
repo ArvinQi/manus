@@ -26,13 +26,13 @@ export class ToolCollection {
   constructor(...tools: BaseTool[]) {
     // 创建默认工具
     const defaultTools = [
-      new AskHumanTool(),
-      new CreateChatCompletionTool(),
+      // new AskHumanTool(),
+      // new CreateChatCompletionTool(),
       new FileOperatorsTool(),
       new PlanningTool(),
       new StrReplaceEditorTool(),
       new BashTool(),
-      // new SystemInfoTool(),
+      // // new SystemInfoTool(),
       new Terminate(),
     ];
 

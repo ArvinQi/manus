@@ -15,7 +15,7 @@ import { Terminate } from '../tool/terminate.js';
 // import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 // 创建日志记录器 - 禁用控制台输出，只写入到文件
-const logger = new Logger('MCPServer', { useConsole: true });
+const logger = new Logger('MCPServer', { useConsole: false });
 
 // 创建 MCP Server
 const server = new McpServer({ name: 'manus', version: '1.0.0' });
@@ -44,32 +44,32 @@ server.tool(
 );
 
 // 注册 ask_human 工具
-server.tool(
-  'ask_human',
-  {
-    question: z.string().describe('要向人类用户提出的问题'),
-    options: z.array(z.string()).optional().describe('可选的选项列表'),
-    default_value: z.string().optional().describe('默认值'),
-    timeout: z.number().optional().describe('超时时间(毫秒)'),
-  },
-  async ({ question, options, default_value, timeout }) => {
-    logger.info(`向用户提问: ${question}`);
-    const askHumanTool = new AskHumanTool();
-    const result = await askHumanTool.run({ question, options, default_value, timeout });
-    return {
-      content: [
-        {
-          type: 'text',
-          text: result.output
-            ? String(result.output)
-            : result.error
-              ? `错误: ${result.error}`
-              : '用户未回答',
-        },
-      ],
-    };
-  }
-);
+// server.tool(
+//   'ask_human',
+//   {
+//     question: z.string().describe('要向人类用户提出的问题'),
+//     options: z.array(z.string()).optional().describe('可选的选项列表'),
+//     default_value: z.string().optional().describe('默认值'),
+//     timeout: z.number().optional().describe('超时时间(毫秒)'),
+//   },
+//   async ({ question, options, default_value, timeout }) => {
+//     logger.info(`向用户提问: ${question}`);
+//     const askHumanTool = new AskHumanTool();
+//     const result = await askHumanTool.run({ question, options, default_value, timeout });
+//     return {
+//       content: [
+//         {
+//           type: 'text',
+//           text: result.output
+//             ? String(result.output)
+//             : result.error
+//               ? `错误: ${result.error}`
+//               : '用户未回答',
+//         },
+//       ],
+//     };
+//   }
+// );
 
 // 注册 file_operators 工具
 server.tool(
@@ -119,7 +119,6 @@ server.tool(
       return { content: [{ type: 'text', text: `读取文件失败: ${readResult.error}` }] };
     }
 
-    // 执行替换
     const content = String(readResult.output);
     const result = await editorTool.run({ content, pattern: find, replacement: replace });
 
@@ -148,46 +147,64 @@ server.tool(
 );
 
 // 注册 system_info 工具
-server.tool(
-  'system_info',
-  {
-    info_type: z
-      .enum(['os', 'arch', 'platform', 'env', 'cpu', 'memory', 'network', 'all'])
-      .optional()
-      .default('all')
-      .describe('系统信息类型'),
-    env_var: z.string().optional().describe('要获取的特定环境变量名称'),
-  },
-  async ({ info_type = 'all', env_var }) => {
-    logger.info(`获取系统信息: ${info_type}`);
-    const systemInfoTool = new SystemInfoTool();
-    const result = await systemInfoTool.run({ info_type, env_var });
-    return {
-      content: [
-        {
-          type: 'text',
-          text: result.output
-            ? JSON.stringify(result.output)
-            : result.error
-              ? `错误: ${result.error}`
-              : '获取系统信息完成',
-        },
-      ],
-    };
-  }
-);
+// server.tool(
+//   'system_info',
+//   {
+//     info_type: z
+//       .enum(['os', 'arch', 'platform', 'env', 'cpu', 'memory', 'network', 'all'])
+//       .optional()
+//       .default('all')
+//       .describe('系统信息类型'),
+//     env_var: z.string().optional().describe('要获取的特定环境变量名称'),
+//   },
+//   async ({ info_type = 'all', env_var }) => {
+//     logger.info(`获取系统信息: ${info_type}`);
+//     const systemInfoTool = new SystemInfoTool();
+//     const result = await systemInfoTool.run({ info_type, env_var });
+//     return {
+//       content: [
+//         {
+//           type: 'text',
+//           text: result.output
+//             ? JSON.stringify(result.output)
+//             : result.error
+//               ? `错误: ${result.error}`
+//               : '获取系统信息完成',
+//         },
+//       ],
+//     };
+//   }
+// );
 
 // 注册 planning 工具
 server.tool(
   'planning',
   {
-    task: z.string().describe('任务描述'),
-    context: z.string().optional().describe('任务上下文'),
+    command: z
+      .enum(['create', 'update', 'list', 'get', 'set_active', 'mark_step', 'delete'])
+      .describe('要执行的操作命令'),
+    plan_id: z.string().optional().describe('计划唯一标识符'),
+    title: z.string().optional().describe('计划标题'),
+    steps: z.array(z.string()).optional().describe('计划步骤列表'),
+    step_index: z.number().optional().describe('步骤索引(0开始)'),
+    step_status: z
+      .enum(['not_started', 'in_progress', 'completed', 'blocked'])
+      .optional()
+      .describe('步骤状态'),
+    step_notes: z.string().optional().describe('步骤备注'),
   },
-  async ({ task, context }) => {
-    logger.info(`规划任务: ${task}`);
+  async ({ command, plan_id, title, steps, step_index, step_status, step_notes }) => {
+    logger.info(`执行规划操作: ${command} ${plan_id ? 'plan_id=' + plan_id : ''}`);
     const planningTool = new PlanningTool();
-    const result = await planningTool.run({ task, context });
+    const result = await planningTool.run({
+      command,
+      plan_id,
+      title,
+      steps,
+      step_index,
+      step_status,
+      step_notes,
+    });
     return {
       content: [
         {

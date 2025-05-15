@@ -22,7 +22,7 @@ const logger = new Logger('Main');
  */
 export async function main() {
   const continueTask = process.argv.includes('--continue');
-  const useMcpServer = process.argv.includes('--use-mcp-server') || true;
+  const useMcpServer = process.argv.includes('--use-mcp-server');
   const maxSteps = parseInt(process.argv[3], 10) || 30;
 
   // 创建并初始化代理
@@ -66,6 +66,7 @@ export async function main() {
       logger.info(`请求处理完成，耗时 ${elapsedTime.toFixed(2)} 秒`);
       logger.info(result);
     } catch (error) {
+      console.log('🚀🚀🚀🚀🚀🚀 ~ file: main.ts:69 ~ main ~ error:', error);
       logger.error('请求处理超时');
       logger.info('由于超时，操作已终止。请尝试一个更简单的请求。');
     }
