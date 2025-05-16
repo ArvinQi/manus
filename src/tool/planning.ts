@@ -192,7 +192,7 @@ export class PlanningTool extends BaseTool {
     this._current_plan_id = plan_id; // 设置为活动计划
 
     // 保存计划到文件
-    await this._savePlansToFile();
+    await this._savePlansToMarkdown();
 
     return new ToolResult({
       output: `Plan created successfully with ID: ${plan_id}\n\n${this._formatPlan(plan)}`,
@@ -257,7 +257,7 @@ export class PlanningTool extends BaseTool {
     }
 
     // 保存更新后的计划到文件
-    await this._savePlansToFile();
+    await this._savePlansToMarkdown();
 
     return new ToolResult({
       output: `Plan updated successfully: ${plan_id}\n\n${this._formatPlan(plan)}`,
@@ -387,7 +387,7 @@ export class PlanningTool extends BaseTool {
     }
 
     // 保存更新后的计划到文件
-    await this._savePlansToFile();
+    await this._savePlansToMarkdown();
 
     return new ToolResult({
       output: `Step ${step_index} updated in plan '${plan_id}'.\n\n${this._formatPlan(plan)}`,
@@ -415,7 +415,7 @@ export class PlanningTool extends BaseTool {
     }
 
     // 保存更新后的计划到文件
-    await this._savePlansToFile();
+    await this._savePlansToMarkdown();
 
     return new ToolResult({ output: `Plan '${plan_id}' has been deleted.` });
   }
@@ -467,6 +467,76 @@ export class PlanningTool extends BaseTool {
     }
 
     return output;
+  }
+
+  /**
+   * Markdown格式化计划内容
+   */
+  private _formatPlanMarkdown(plan: Plan): string {
+    let output = `# ${plan.title} (ID: ${plan.plan_id})\n`;
+    output += `\n`;
+    const totalSteps = plan.steps.length;
+    const completed = plan.step_statuses.filter((status) => status === 'completed').length;
+    const inProgress = plan.step_statuses.filter((status) => status === 'in_progress').length;
+    const blocked = plan.step_statuses.filter((status) => status === 'blocked').length;
+    const notStarted = plan.step_statuses.filter((status) => status === 'not_started').length;
+    output += `**进度**: ${completed}/${totalSteps} 步已完成 `;
+    if (totalSteps > 0) {
+      const percentage = (completed / totalSteps) * 100;
+      output += `(${percentage.toFixed(1)}%)\n`;
+    } else {
+      output += '(0%)\n';
+    }
+    output += `\n**状态**: ${completed} 完成, ${inProgress} 进行中, ${blocked} 阻塞, ${notStarted} 未开始\n`;
+    output += `\n## 步骤\n`;
+    for (let i = 0; i < plan.steps.length; i++) {
+      const step = plan.steps[i];
+      const status = plan.step_statuses[i];
+      const notes = plan.step_notes[i];
+      const statusSymbol =
+        {
+          not_started: '- [ ]',
+          in_progress: '- [→]',
+          completed: '- [x]',
+          blocked: '- [!]',
+        }[status] || '- [ ]';
+      output += `${statusSymbol} ${step}\n`;
+      if (notes) {
+        output += `  > 备注: ${notes}\n`;
+      }
+    }
+    return output;
+  }
+
+  /**
+   * 保存计划到md文件
+   * @returns ToolResult 包含操作结果或错误信息
+   */
+  private async _savePlansToMarkdown(): Promise<ToolResult> {
+    try {
+      await this._ensureManusDirExists();
+      for (const planId of Object.keys(this.plans)) {
+        const plan = this.plans[planId];
+        const mdContent = this._formatPlanMarkdown(plan);
+        const mdPath = `./.manus/plan_${planId}.md`;
+        const result = await this.fileOperator.run({
+          operation: 'write',
+          path: mdPath,
+          content: mdContent,
+          encoding: 'utf-8',
+        });
+        if (result.error) {
+          const errorMsg = `保存计划Markdown失败: ${result.error}`;
+          this.logger.error(errorMsg);
+          return new ToolResult({ error: errorMsg });
+        }
+      }
+      return new ToolResult({ output: '计划已同步到Markdown文件' });
+    } catch (error) {
+      const errorMsg = `保存计划Markdown时出错: ${error instanceof Error ? error.message : String(error)}`;
+      this.logger.error(errorMsg);
+      return new ToolResult({ error: errorMsg });
+    }
   }
 
   /**
