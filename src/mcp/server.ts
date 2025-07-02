@@ -192,8 +192,10 @@ server.tool(
       .optional()
       .describe('步骤状态'),
     step_notes: z.string().optional().describe('步骤备注'),
+    task: z.string().optional().describe('当前任务上下文'),
+    step: z.number().optional().describe('当前步骤索引'),
   },
-  async ({ command, plan_id, title, steps, step_index, step_status, step_notes }) => {
+  async ({ command, plan_id, title, steps, step_index, step_status, step_notes, task, step }) => {
     logger.info(`执行规划操作: ${command} ${plan_id ? 'plan_id=' + plan_id : ''}`);
     const planningTool = new PlanningTool();
     const result = await planningTool.run({
@@ -253,9 +255,6 @@ server.tool('terminate', { reason: z.string().describe('终止执行的原因') 
 
 // 启动 MCP Server，使用 stdio 作为 transport
 const transport = new StdioServerTransport();
-// const transport = new StreamableHTTPClientTransport(
-//   new URL(process.env.MCP_SERVER_URL || 'http://localhost:41741')
-// );
 
 server
   .connect(transport)

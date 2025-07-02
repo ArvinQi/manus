@@ -11,11 +11,11 @@ import { ToolCall, ToolChoice } from '../schema/index.js';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
 import { BaseTool } from '../tool/base.js';
+import { McpClient } from '../mcp/mcp_client';
+import { MultiAgentSystem } from '../core/multi_agent_system';
+import { ToolRouter } from '../core/tool_router';
 
 // 系统提示词
 const SYSTEM_PROMPT = `你是一个功能强大的智能助手，可以帮助用户完成各种任务。
@@ -41,11 +41,17 @@ export class Manus extends ToolCallAgent {
   // 是否已初始化
   private _initialized: boolean = false;
 
-  // MCP 客户端
-  private mcpClient?: McpClient;
-
-  // MCP 服务器进程
+  // MCP 服务器进程（如果需要的话）
   private mcpServerProcess?: any;
+
+  // MCP 客户端
+  protected mcpClient?: McpClient;
+
+  // 多智能体系统
+  protected multiAgentSystem?: MultiAgentSystem;
+
+  // 工具路由器
+  protected toolRouter?: ToolRouter;
 
   // 任务状态相关属性
   private _taskState: {
@@ -69,6 +75,8 @@ export class Manus extends ToolCallAgent {
       tools?: ToolCollection;
       useMcpServer?: boolean;
       enableTaskContinuity?: boolean; // 是否启用任务连续性功能
+      mcpClient?: McpClient;
+      multiAgentSystem?: MultiAgentSystem;
     } = {}
   ) {
     super({
@@ -83,6 +91,33 @@ export class Manus extends ToolCallAgent {
       toolChoice: ToolChoice.AUTO,
       specialToolNames: ['Terminate'],
     });
+
+    // 设置 MCP 客户端
+    if (options.mcpClient) {
+      this.mcpClient = options.mcpClient;
+    }
+
+    // 设置多智能体系统
+    if (options.multiAgentSystem) {
+      this.multiAgentSystem = options.multiAgentSystem;
+
+      // 如果有多智能体系统，创建工具路由器
+      this.toolRouter = new ToolRouter(
+        this.multiAgentSystem.mcpManager,
+        this.multiAgentSystem.agentManager,
+        this.multiAgentSystem.decisionEngine,
+        {
+          strategy: 'hybrid', // 使用混合策略
+          mcpPriority: 0.6, // MCP优先级
+          a2aPriority: 0.4, // A2A优先级
+          loadBalanceThreshold: 0.8, // 负载均衡阈值
+          enableFallback: true, // 启用回退机制
+          maxRetries: 2, // 最大重试次数
+          timeoutMs: 30000, // 超时时间
+        },
+        this.logger
+      );
+    }
 
     // 初始化任务状态
     this._taskState = {
@@ -107,6 +142,8 @@ export class Manus extends ToolCallAgent {
       tools?: ToolCollection;
       useMcpServer?: boolean;
       continueTask?: boolean; // 新增参数，决定是否继续任务
+      mcpClient?: McpClient;
+      multiAgentSystem?: MultiAgentSystem;
     } = {}
   ): Promise<Manus> {
     const instance = new Manus(options);
@@ -151,9 +188,10 @@ export class Manus extends ToolCallAgent {
       fs.mkdirSync(manusDir, { recursive: true });
     }
 
-    // 如果使用 MCP Server，则启动服务器并连接客户端
+    // MCP 服务器连接现在通过 MultiMcpManager 管理，不再在这里直接连接
+    // 避免 StdioClientTransport 导致的日志解析问题
     if (useMcpServer) {
-      await this.initializeMcpServer();
+      this.logger.info('MCP 服务器连接将通过 MultiMcpManager 管理');
     }
 
     // 启动定期保存任务状态的功能
@@ -161,59 +199,6 @@ export class Manus extends ToolCallAgent {
 
     this._initialized = true;
     this.logger.info('Manus 代理已初始化');
-  }
-
-  /**
-   * 初始化 MCP 服务器和客户端
-   */
-  private async initializeMcpServer(): Promise<void> {
-    try {
-      // 读取 MCP Server 地址（可从配置或环境变量获取）
-      // const serverUrl = process.env.MCP_SERVER_URL || 'http://localhost:41741/mcp';
-      // this.logger.info(`连接到 MCP 服务器: ${serverUrl}`);
-      this.logger.info(`连接到 MCP 服务器`);
-      // 创建 MCP 客户端
-      const transport = new StdioClientTransport({
-        command: 'node',
-        args: ['dist/mcp/server.js'],
-        stderr: 'inherit',
-      });
-
-      // 创建 MCP 客户端
-      this.mcpClient = new McpClient({
-        name: 'manus-client',
-        version: '1.0.0',
-      });
-
-      await this.mcpClient.connect(transport);
-
-      this.mcpClient.onerror = (error: any) => {
-        this.logger.error('MCP 客户端错误: ' + error);
-      };
-
-      // 使用 HTTP 传输层连接 MCP Server
-      // const transport = new StreamableHTTPClientTransport(new URL(serverUrl));
-      // await this.mcpClient.connect(transport);
-      // 获取可用工具
-      const toolsResult = await this.mcpClient.request(
-        { method: 'tools/list', params: {} },
-        z.object({ tools: z.array(z.any()) })
-      );
-
-      const tools = toolsResult.tools.map((tool) => ({
-        name: tool.name,
-        description: tool.inputSchema.description || '',
-        parameters: tool.inputSchema,
-      }));
-
-      // this.availableTools = new ToolCollection(...tools);
-      this.logger.info(
-        `已连接到 MCP 服务器，可用工具: ${tools.map((t: any) => t.name).join(', ')}`
-      );
-    } catch (error) {
-      this.logger.error(`MCP 服务器初始化失败: ${(error as Error).message}`);
-      throw error;
-    }
   }
 
   /**
@@ -601,14 +586,13 @@ export class Manus extends ToolCallAgent {
 
   /**
    * 执行工具调用
-   * 如果使用 MCP 服务器，则通过 MCP 客户端调用工具
-   * 否则使用父类的工具调用方法
+   * 通过智能工具路由器自动选择MCP服务或A2A代理来执行工具
    * @param commandOrName 工具调用命令或工具名称
    * @param args 工具参数（当第一个参数为工具名称时使用）
    */
   protected async executeToolCall(commandOrName: ToolCall | string, args?: any): Promise<any> {
-    // 如果使用 MCP 客户端，则通过 MCP 调用工具
-    if (this.mcpClient) {
+    // 如果有工具路由器，使用智能路由
+    if (this.toolRouter) {
       try {
         // 获取工具名称和参数
         let toolName: string;
@@ -631,8 +615,10 @@ export class Manus extends ToolCallAgent {
           }
         }
 
-        this.logger.info(`通过 MCP 调用工具: ${toolName}`);
-        const result = await this.mcpClient.callTool({
+        this.logger.info(`通过智能路由器调用工具: ${toolName}`);
+
+        // 构建工具调用请求
+        const toolRequest = {
           name: toolName,
           arguments: toolArgs,
           context: {
@@ -641,20 +627,29 @@ export class Manus extends ToolCallAgent {
               : 'default_task',
             step: this._taskState.currentStepIndex ?? -1,
           },
-        });
+        };
+
+        // 通过工具路由器执行
+        const routerResult = await this.toolRouter.executeToolCall(toolRequest);
+
+        if (!routerResult.success) {
+          throw new Error(routerResult.error || '工具执行失败');
+        }
 
         // 如果是直接调用（通过工具名称和参数），返回处理后的结果
         if (typeof commandOrName === 'string') {
           return {
-            output: (result as any).content?.[0]?.text || JSON.stringify(result),
+            output: this.formatToolResult(routerResult.result),
             error: null,
+            executedBy: routerResult.executedBy,
+            executionTime: routerResult.executionTime,
           };
         }
 
         // 如果是通过 ToolCall 对象调用，返回格式化的观察结果
-        return `观察到执行的命令 \`${toolName}\` 的输出:\n${(result as any).content?.[0]?.text || JSON.stringify(result)}`;
+        return `观察到执行的命令 \`${toolName}\` 的输出 (由 ${routerResult.executedBy} 执行):\n${this.formatToolResult(routerResult.result)}`;
       } catch (error) {
-        this.logger.error(`MCP 工具调用失败: ${(error as Error).message}`);
+        this.logger.error(`智能路由工具调用失败: ${(error as Error).message}`);
 
         // 如果是直接调用（通过工具名称和参数），返回错误结果
         if (typeof commandOrName === 'string') {
@@ -669,8 +664,33 @@ export class Manus extends ToolCallAgent {
       }
     }
 
-    // 否则使用父类的工具调用方法
+    // 回退到父类的工具调用方法（保持向后兼容）
     return super.executeToolCall(commandOrName, args);
+  }
+
+  /**
+   * 格式化工具结果
+   */
+  private formatToolResult(result: any): string {
+    if (typeof result === 'string') {
+      return result;
+    }
+
+    if (result && typeof result === 'object') {
+      // 如果是MCP结果格式
+      if (result.content && Array.isArray(result.content)) {
+        return result.content.map((item: any) => item.text || JSON.stringify(item)).join('\n');
+      }
+
+      // 如果是A2A结果格式
+      if (result.result !== undefined) {
+        return typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
+      }
+
+      return JSON.stringify(result, null, 2);
+    }
+
+    return String(result);
   }
 
   /**
