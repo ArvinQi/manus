@@ -5,7 +5,8 @@
 
 import { ReActAgent } from './react.js';
 import { AgentState, Memory, Message, Role } from '../schema/index.js';
-import { LLM } from '../llm/index.js';
+import { LLM, TaskType } from '../llm/index.js';
+import { llmFactory } from '../llm/factory.js';
 import { Logger } from '../utils/logger.js';
 import { ToolCollection } from '../tool/tool_collection.js';
 import { BashTool } from '../tool/bash.js';
@@ -58,6 +59,7 @@ export class CoderAgent extends ReActAgent {
   private bashTool: BashTool;
   private fileOps: FileOperatorsTool;
   private toolCollection: ToolCollection;
+  llm: LLM;
 
   /**
    * 实现思考过程
@@ -81,17 +83,22 @@ export class CoderAgent extends ReActAgent {
 
   /**
    * 构造函数
-   * @param llm LLM 实例
    * @param tools 工具集合
    * @param config 配置
+   * @param userId 用户ID（可选）
    */
-  constructor(llm: LLM, tools: ToolCollection, config: CoderAgentConfig = {}) {
+  constructor(tools: ToolCollection, config: CoderAgentConfig = {}, userId?: string) {
     super({
       name: 'CoderAgent',
       description: '智能编码助手',
-      systemPrompt: '你是一个专业的编程助手，可以帮助用户完成各种编码任务。',
-      maxSteps: 10
+      systemPrompt:
+        '你是一个专业的编程助手，擅长代码编写、调试和优化。使用高效的编码模型来提供最佳的编程体验。',
+      maxSteps: 10,
     });
+
+    // 使用专门的 coder 模型
+    this.llm = llmFactory.getLLM(TaskType.CODING, undefined, userId);
+    this.logger.info(`CoderAgent initialized with coder model: ${this.llm.getModelInfo().model}`);
 
     // 默认配置
     this.config = {
@@ -239,21 +246,18 @@ export class CoderAgent extends ReActAgent {
       const prompt = `${this.config.evaluationPrompt}\n\n任务: ${task}\n\n代码:\n${code}`;
 
       const messages = [
-        {
-          role: Role.SYSTEM,
-          content: '你是一个专业的代码评估专家，擅长评估代码质量、正确性和效率。',
-        },
-        {
-          role: Role.USER,
-          content: prompt,
-        },
+        Message.systemMessage('你是一个专业的代码评估专家，擅长评估代码质量、正确性和效率。'),
+        Message.userMessage(prompt),
       ];
 
-      // 使用私有方法的替代方案
-      const result = await (this.llm as any).sendRequest({ messages });
+      // 使用 LLM 评估代码
+      const result = await this.llm.ask({
+        messages,
+        currentQuery: `评估代码: ${task}`,
+      });
 
       // 处理可能为null的内容
-      return this.parseEvaluation(result.content || '');
+      return this.parseEvaluation(result || '');
     } catch (error) {
       this.logger.error(`评估代码失败: ${error}`);
       return {

@@ -181,8 +181,7 @@ export class TaskManager extends EventEmitter {
     this.insertTaskIntoQueue(queueItem);
     this.statistics.totalTasks++;
 
-    // 记录到内存
-    await this.memoryManager.recordTaskSubmission(task);
+    // 不再记录详细的任务提交信息，只记录关键事件
 
     this.emit('task_submitted', { task, priority: priorityScore });
 
@@ -408,8 +407,7 @@ export class TaskManager extends EventEmitter {
       this.runningTasks.set(task.id, runningTask);
       this.emit('task_started', { task, decision });
 
-      // 记录到内存
-      await this.memoryManager.recordTaskExecution(task, decision);
+      // 不再记录详细的任务执行信息
 
       // 执行任务
       const executionPromise = this.performTaskExecution(runningTask);
@@ -428,8 +426,7 @@ export class TaskManager extends EventEmitter {
       this.completedTasks.set(task.id, result);
       this.taskHistory.push(result);
 
-      // 记录到内存
-      await this.memoryManager.recordTaskCompletion(task, result);
+      // 不再记录详细的任务完成信息
 
       this.emit('task_completed', { task, result });
     } catch (error) {
@@ -803,8 +800,7 @@ export class TaskManager extends EventEmitter {
     // 触发高优先级任务事件
     this.emit('high_priority_task', task);
 
-    // 记录到内存
-    await this.memoryManager.recordTaskSubmission(task);
+    // 不再记录详细的任务提交信息
 
     return task.id;
   }

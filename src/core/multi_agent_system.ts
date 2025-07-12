@@ -106,7 +106,7 @@ export class MultiAgentSystem extends EventEmitter {
       a2aPriority: 0.4,
       timeout: 30000,
       retryCount: 2,
-      fallbackEnabled: true
+      fallbackEnabled: true,
     });
     this.taskManager = new TaskManager(
       config.task_management,
@@ -306,11 +306,10 @@ export class MultiAgentSystem extends EventEmitter {
 
     this.logger.info(`提交任务: ${task.id} - ${taskDescription}`);
 
-    // 记录用户交互
-    await this.memoryManager.recordUserInteraction('task_submission', {
+    // 记录为重要事件而不是用户交互
+    await this.memoryManager.recordImportantEvent('task_submission', {
       taskId: task.id,
-      description: taskDescription,
-      options,
+      description: taskDescription, // 限制长度
     });
 
     // 提交到任务管理器
@@ -352,11 +351,10 @@ export class MultiAgentSystem extends EventEmitter {
 
     this.logger.info(`插入高优先级任务: ${task.id} - ${taskDescription}`);
 
-    // 记录用户交互
-    await this.memoryManager.recordUserInteraction('urgent_task_submission', {
+    // 记录为重要事件
+    await this.memoryManager.recordImportantEvent('urgent_task_submission', {
       taskId: task.id,
-      description: taskDescription,
-      options,
+      description: taskDescription.substring(0, 100), // 限制长度
     });
 
     // 插入高优先级任务
@@ -592,10 +590,12 @@ export class MultiAgentSystem extends EventEmitter {
       this.events = this.events.slice(-5000);
     }
 
-    // 记录到内存管理器
+    // 记录到内存管理器（只记录重要事件）
     try {
-      await this.memoryManager.recordSystemEvent(type, data, severity === 'error' ? 0.9 : 0.5);
+      const importanceScore = severity === 'error' ? 0.9 : severity === 'warning' ? 0.7 : 0.5;
+      await this.memoryManager.recordImportantEvent(type, data, importanceScore);
     } catch (error) {
+      console.log('🚀🚀🚀🚀🚀🚀 ~ MultiAgentSystem ~ error:', error);
       this.logger.error(`记录系统事件失败: ${error}`);
     }
 
@@ -672,6 +672,20 @@ export class MultiAgentSystem extends EventEmitter {
   }
 
   /**
+   * 获取MCP管理器
+   */
+  getMcpManager(): MultiMcpManager {
+    return this.mcpManager;
+  }
+
+  /**
+   * 获取A2A代理管理器
+   */
+  getAgentManager(): A2AAgentManager {
+    return this.agentManager;
+  }
+
+  /**
    * 获取决策引擎
    */
   getDecisionEngine(): DecisionEngine {
@@ -690,6 +704,13 @@ export class MultiAgentSystem extends EventEmitter {
    */
   getTaskManager(): TaskManager {
     return this.taskManager;
+  }
+
+  /**
+   * 获取记忆管理器
+   */
+  getMemoryManager(): MemoryManager {
+    return this.memoryManager;
   }
 
   /**
@@ -764,8 +785,7 @@ export class MultiAgentSystem extends EventEmitter {
           break;
       }
 
-      // 记录到OpenMemory
-      await this.memoryManager.recordTaskSubmission(task);
+      // 任务详情不再记录到记忆中，只记录重要事件
     } catch (error) {
       this.logger.error('处理高优先级任务失败:', error);
       await this.recordSystemEvent(
@@ -783,7 +803,7 @@ export class MultiAgentSystem extends EventEmitter {
    * 处理紧急任务
    */
   private async handleUrgentTask(task: Task): Promise<void> {
-    this.logger.warning(`收到紧急任务: ${task.id}`);
+    this.logger.warn(`收到紧急任务: ${task.id}`);
 
     try {
       // 紧急任务总是立即中断
@@ -800,8 +820,7 @@ export class MultiAgentSystem extends EventEmitter {
         'warning'
       );
 
-      // 记录到OpenMemory
-      await this.memoryManager.recordTaskSubmission(task);
+      // 任务详情不再记录到记忆中，只记录重要事件
     } catch (error) {
       this.logger.error('处理紧急任务失败:', error);
       await this.recordSystemEvent(

@@ -11,6 +11,17 @@ import { Logger } from '../utils/logger.js';
 import { McpServiceConfig } from '../schema/multi_agent_config.js';
 import { EventEmitter } from 'events';
 
+// 导入系统内置工具
+import { BashTool } from '../tool/bash.js';
+import { AskHumanTool } from '../tool/ask_human.js';
+import { CreateChatCompletionTool } from '../tool/create_chat_completion.js';
+import { FileOperatorsTool } from '../tool/file_operators.js';
+import { PlanningTool } from '../tool/planning.js';
+import { StrReplaceEditorTool } from '../tool/str_replace_editor.js';
+import { SystemInfoTool } from '../tool/system_info.js';
+import { Terminate } from '../tool/terminate.js';
+import { BaseTool } from '../tool/base.js';
+
 // MCP服务状态
 export enum McpServiceStatus {
   DISCONNECTED = 'disconnected',
@@ -32,6 +43,8 @@ export interface McpServiceInstance {
   tools: any[];
   resources: any[];
   metadata: Record<string, any>;
+  // 系统内置工具实例
+  systemTools?: Map<string, BaseTool>;
 }
 
 // 服务选择策略
@@ -62,6 +75,9 @@ export class MultiMcpManager extends EventEmitter {
   async initialize(configs: McpServiceConfig[]): Promise<void> {
     this.logger.info(`初始化 ${configs.length} 个MCP服务`);
 
+    // 首先初始化系统内置工具服务
+    await this.initializeSystemTools();
+
     // 并行初始化所有服务
     const initPromises = configs.map((config) => this.initializeService(config));
     const results = await Promise.allSettled(initPromises);
@@ -75,7 +91,73 @@ export class MultiMcpManager extends EventEmitter {
     // 启动健康检查
     this.startHealthCheck();
 
-    this.emit('initialized', { successful, failed, total: configs.length });
+    this.emit('initialized', { successful, failed, total: configs.length + 1 }); // +1 for system tools
+  }
+
+  /**
+   * 初始化系统内置工具
+   */
+  private async initializeSystemTools(): Promise<void> {
+    this.logger.info('初始化系统内置工具服务');
+
+    try {
+      // 创建系统工具实例
+      const systemTools = new Map<string, BaseTool>();
+
+      // 初始化所有系统工具
+      systemTools.set('bash', new BashTool());
+      systemTools.set('ask_human', new AskHumanTool());
+      systemTools.set('create_chat_completion', new CreateChatCompletionTool());
+      systemTools.set('file_operators', new FileOperatorsTool());
+      systemTools.set('planning', new PlanningTool());
+      systemTools.set('str_replace_editor', new StrReplaceEditorTool());
+      systemTools.set('system_info', new SystemInfoTool());
+      systemTools.set('terminate', new Terminate());
+
+      // 创建系统工具的MCP服务实例
+      const systemToolsConfig: McpServiceConfig = {
+        name: 'system_tools',
+        type: 'stdio', // 使用stdio类型作为占位符
+        enabled: true,
+        capabilities: ['bash', 'file_operations', 'planning', 'chat_completion', 'system_info'],
+        priority: 1,
+        timeout: 30000,
+        retry_count: 3,
+        health_check_interval: 60000,
+        metadata: {
+          description: 'System built-in tools',
+          version: '1.0.0',
+          builtin: true,
+        },
+      };
+
+      // 生成工具描述
+      const toolDescriptions = Array.from(systemTools.entries()).map(([name, tool]) => ({
+        name,
+        description: tool.description,
+        inputSchema: tool.parameters || {},
+      }));
+
+      const systemInstance: McpServiceInstance = {
+        config: systemToolsConfig,
+        client: {} as McpClient, // 内置工具不需要真正的MCP客户端
+        transport: null,
+        status: McpServiceStatus.CONNECTED,
+        lastHealthCheck: Date.now(),
+        errorCount: 0,
+        tools: toolDescriptions,
+        resources: [],
+        metadata: systemToolsConfig.metadata || {},
+        systemTools,
+      };
+
+      this.services.set('system_tools', systemInstance);
+      this.logger.info('系统内置工具服务初始化完成');
+      this.emit('serviceConnected', 'system_tools');
+    } catch (error) {
+      this.logger.error('系统内置工具服务初始化失败:', error);
+      throw error;
+    }
   }
 
   /**
@@ -162,7 +244,7 @@ export class MultiMcpManager extends EventEmitter {
     });
 
     process.on('exit', (code) => {
-      this.logger.warning(`MCP服务进程退出 ${config.name}, 退出码: ${code}`);
+      this.logger.warn(`MCP服务进程退出 ${config.name}, 退出码: ${code}`);
       this.handleServiceDisconnect(config.name);
     });
   }
@@ -226,7 +308,7 @@ export class MultiMcpManager extends EventEmitter {
     );
 
     if (availableServices.length === 0) {
-      this.logger.warning('没有可用的MCP服务');
+      this.logger.warn('没有可用的MCP服务');
       return null;
     }
 
@@ -243,7 +325,7 @@ export class MultiMcpManager extends EventEmitter {
     }
 
     if (candidateServices.length === 0) {
-      this.logger.warning(`没有支持所需能力的MCP服务: ${requiredCapabilities.join(', ')}`);
+      this.logger.warn(`没有支持所需能力的MCP服务: ${requiredCapabilities.join(', ')}`);
       return null;
     }
 
@@ -304,6 +386,28 @@ export class MultiMcpManager extends EventEmitter {
     }
 
     try {
+      // 检查是否为系统内置工具
+      if (service.systemTools) {
+        const systemTool = service.systemTools.get(toolName);
+        if (systemTool) {
+          this.logger.info(`调用系统内置工具: ${toolName}`);
+          const result = await systemTool.run(args);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: result.output
+                  ? String(result.output)
+                  : result.error
+                    ? `错误: ${result.error}`
+                    : '操作完成',
+              },
+            ],
+          };
+        }
+      }
+
+      // 调用外部MCP服务工具
       const result = await service.client.callTool({ name: toolName, arguments: args });
       return result;
     } catch (error) {
@@ -402,15 +506,28 @@ export class MultiMcpManager extends EventEmitter {
     return service ? service.status === McpServiceStatus.CONNECTED : false;
   }
 
+  /**
+   * 检查代理是否可用（向后兼容）
+   */
+  async isAgentAvailable(agentName: string): Promise<boolean> {
+    return this.isServiceAvailable(agentName);
+  }
+
   private async performHealthCheck(): Promise<void> {
     for (const [name, service] of this.services) {
       if (service.status === McpServiceStatus.CONNECTED) {
         try {
+          // 系统内置工具跳过健康检查
+          if (service.systemTools) {
+            service.lastHealthCheck = Date.now();
+            continue;
+          }
+
           // 简单的ping检查
           await service.client.listTools();
           service.lastHealthCheck = Date.now();
         } catch (error) {
-          this.logger.warning(`MCP服务健康检查失败 ${name}:`, error);
+          this.logger.warn(`MCP服务健康检查失败 ${name}:`, error);
           this.handleServiceError(name, error);
         }
       }
@@ -429,7 +546,7 @@ export class MultiMcpManager extends EventEmitter {
 
       // 如果错误次数过多，尝试重连
       if (service.errorCount >= service.config.retry_count) {
-        this.logger.warning(`MCP服务 ${serviceName} 错误次数过多，尝试重连`);
+        this.logger.warn(`MCP服务 ${serviceName} 错误次数过多，尝试重连`);
         this.reconnectService(serviceName);
       }
     }
@@ -527,7 +644,7 @@ export class MultiMcpManager extends EventEmitter {
    */
   async addService(config: McpServiceConfig): Promise<void> {
     if (this.services.has(config.name)) {
-      this.logger.warning(`MCP服务 ${config.name} 已存在，将被替换`);
+      this.logger.warn(`MCP服务 ${config.name} 已存在，将被替换`);
       await this.removeService(config.name);
     }
 
@@ -541,7 +658,7 @@ export class MultiMcpManager extends EventEmitter {
   async removeService(name: string): Promise<void> {
     const service = this.services.get(name);
     if (!service) {
-      this.logger.warning(`尝试移除不存在的MCP服务: ${name}`);
+      this.logger.warn(`尝试移除不存在的MCP服务: ${name}`);
       return;
     }
 
@@ -580,6 +697,27 @@ export class MultiMcpManager extends EventEmitter {
    */
   getServiceNames(): string[] {
     return Array.from(this.services.keys());
+  }
+
+  /**
+   * 获取所有可用服务
+   */
+  async getAvailableServices(): Promise<
+    Array<{ name: string; capabilities: string[]; tools: any[] }>
+  > {
+    const availableServices: Array<{ name: string; capabilities: string[]; tools: any[] }> = [];
+
+    for (const [name, service] of this.services) {
+      if (service.status === McpServiceStatus.CONNECTED) {
+        availableServices.push({
+          name,
+          capabilities: service.config.capabilities || [],
+          tools: service.tools || [],
+        });
+      }
+    }
+
+    return availableServices;
   }
 
   /**
@@ -636,10 +774,35 @@ export class MultiMcpManager extends EventEmitter {
       }
 
       // 调用选定的工具
-      const result = await service.client.callTool({
-        name: selectedTool.name,
-        arguments: taskRequest.parameters,
-      });
+      let result: any;
+      if (service.systemTools) {
+        const systemTool = service.systemTools.get(selectedTool.name);
+        if (systemTool) {
+          const toolResult = await systemTool.run(taskRequest.parameters);
+          result = {
+            content: [
+              {
+                type: 'text',
+                text: toolResult.output
+                  ? String(toolResult.output)
+                  : toolResult.error
+                    ? `错误: ${toolResult.error}`
+                    : '操作完成',
+              },
+            ],
+          };
+        } else {
+          result = await service.client.callTool({
+            name: selectedTool.name,
+            arguments: taskRequest.parameters,
+          });
+        }
+      } else {
+        result = await service.client.callTool({
+          name: selectedTool.name,
+          arguments: taskRequest.parameters,
+        });
+      }
 
       return {
         taskId: taskRequest.taskId,
@@ -681,10 +844,36 @@ export class MultiMcpManager extends EventEmitter {
 
     try {
       this.logger.info(`通过MCP服务 ${suitableService.config.name} 调用工具: ${toolName}`);
-      const result = await suitableService.client.callTool({
-        name: toolName,
-        arguments: args,
-      });
+
+      let result: any;
+      if (suitableService.systemTools) {
+        const systemTool = suitableService.systemTools.get(toolName);
+        if (systemTool) {
+          const toolResult = await systemTool.run(args);
+          result = {
+            content: [
+              {
+                type: 'text',
+                text: toolResult.output
+                  ? String(toolResult.output)
+                  : toolResult.error
+                    ? `错误: ${toolResult.error}`
+                    : '操作完成',
+              },
+            ],
+          };
+        } else {
+          result = await suitableService.client.callTool({
+            name: toolName,
+            arguments: args,
+          });
+        }
+      } else {
+        result = await suitableService.client.callTool({
+          name: toolName,
+          arguments: args,
+        });
+      }
 
       return {
         result: result,

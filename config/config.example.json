@@ -1,0 +1,152 @@
+{
+  "llm": {
+    "default": {
+      "model": "gpt-4",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "max_tokens": 2000,
+      "temperature": 0.7,
+      "api_type": "openai",
+      "api_version": "2023-12-01-preview"
+    },
+    "fast": {
+      "model": "gpt-3.5-turbo",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "max_tokens": 1000,
+      "temperature": 0.5,
+      "api_type": "openai",
+      "api_version": "2023-12-01-preview"
+    }
+  },
+  "memory": {
+    "enabled": true,
+    "searchLimit": 5,
+    "searchThreshold": 0.7,
+    "maxContextMessages": 10,
+    "compressionThreshold": 50,
+    "autoSaveMessages": true
+  },
+  "browser": {
+    "headless": true,
+    "disable_security": false,
+    "extra_args": [
+      "--no-sandbox",
+      "--disable-dev-shm-usage"
+    ],
+    "max_content_length": 100000
+  },
+  "search": {
+    "engine": "google",
+    "fallback_engines": [
+      "bing",
+      "duckduckgo"
+    ],
+    "retry_delay": 1000,
+    "max_retries": 3,
+    "lang": "zh",
+    "country": "cn"
+  },
+  "workspace": {
+    "root": "."
+  },
+  "mcp_servers": [
+    {
+      "name": "filesystem",
+      "enabled": true,
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/tmp"
+      ],
+      "capabilities": [
+        "filesystem",
+        "read",
+        "write",
+        "search"
+      ],
+      "priority": 1,
+      "timeout": 30000,
+      "retry_count": 3,
+      "metadata": {
+        "description": "文件系统操作服务"
+      }
+    },
+    {
+      "name": "web_search",
+      "enabled": false,
+      "type": "http",
+      "url": "http://localhost:3001/mcp",
+      "capabilities": [
+        "search",
+        "web",
+        "scraping"
+      ],
+      "priority": 2,
+      "timeout": 10000,
+      "retry_count": 2,
+      "metadata": {
+        "description": "网络搜索和爬虫服务"
+      }
+    }
+  ],
+  "a2a_agents": [
+    {
+      "name": "coding_agent",
+      "enabled": false,
+      "type": "http",
+      "endpoint": "http://localhost:8001/api/v1",
+      "capabilities": [
+        "coding",
+        "debug",
+        "refactor",
+        "test"
+      ],
+      "specialties": [
+        "javascript",
+        "python",
+        "typescript"
+      ],
+      "priority": 1,
+      "timeout": 60000,
+      "retry_count": 3,
+      "auth": {
+        "type": "api_key",
+        "credentials": {
+          "api_key": "${CODING_AGENT_API_KEY}"
+        }
+      },
+      "load_balancing": {
+        "strategy": "round_robin",
+        "weight": 1
+      },
+      "metadata": {
+        "description": "专业编码助手代理"
+      }
+    },
+    {
+      "name": "research_agent",
+      "enabled": false,
+      "type": "websocket",
+      "endpoint": "ws://localhost:8002/ws",
+      "capabilities": [
+        "research",
+        "analysis",
+        "summarize"
+      ],
+      "specialties": [
+        "academic",
+        "technical",
+        "business"
+      ],
+      "priority": 2,
+      "timeout": 30000,
+      "retry_count": 2,
+      "metadata": {
+        "description": "研究和分析专家代理"
+      }
+    }
+  ]
+}

@@ -67,7 +67,7 @@ export class BashTool extends BaseTool {
 
       // 如果有错误输出但命令成功执行，将错误输出添加到结果中
       if (stderr) {
-        this.logger.warning(`命令警告: ${stderr}`);
+        this.logger.warn(`命令警告: ${stderr}`);
       }
 
       return new ToolResult({ output: stdout });

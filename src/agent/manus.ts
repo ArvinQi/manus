@@ -13,9 +13,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { z } from 'zod';
 import { BaseTool } from '../tool/base.js';
-import { McpClient } from '../mcp/mcp_client';
-import { MultiAgentSystem } from '../core/multi_agent_system';
-import { ToolRouter } from '../core/tool_router';
+import { MultiAgentSystem } from '../core/multi_agent_system.js';
+import { ToolRouter, RoutingStrategy } from '../core/tool_router.js';
 
 // 系统提示词
 const SYSTEM_PROMPT = `你是一个功能强大的智能助手，可以帮助用户完成各种任务。
@@ -44,8 +43,8 @@ export class Manus extends ToolCallAgent {
   // MCP 服务器进程（如果需要的话）
   private mcpServerProcess?: any;
 
-  // MCP 客户端
-  protected mcpClient?: McpClient;
+  // MCP 客户端（通过多智能体系统管理）
+  // protected mcpClient?: McpClient;
 
   // 多智能体系统
   protected multiAgentSystem?: MultiAgentSystem;
@@ -56,11 +55,15 @@ export class Manus extends ToolCallAgent {
   // 任务状态相关属性
   private _taskState: {
     currentTask?: string; // 当前正在执行的任务描述
+    originalTaskDescription?: string; // 原始任务描述（来自文件或用户输入）
     taskPlan?: string[]; // 任务计划步骤列表
     currentStepIndex?: number; // 当前执行到的步骤索引
+    completedSteps?: string[]; // 已完成的步骤列表
     taskContext?: Map<string, any>; // 任务上下文信息，存储任务执行过程中的关键数据
     lastActiveTime?: number; // 最后活动时间戳
     isTaskActive?: boolean; // 任务是否处于活动状态
+    taskStartTime?: number; // 任务开始时间
+    taskSourceFile?: string; // 任务来源文件路径
   } = {};
 
   constructor(
@@ -75,7 +78,6 @@ export class Manus extends ToolCallAgent {
       tools?: ToolCollection;
       useMcpServer?: boolean;
       enableTaskContinuity?: boolean; // 是否启用任务连续性功能
-      mcpClient?: McpClient;
       multiAgentSystem?: MultiAgentSystem;
     } = {}
   ) {
@@ -92,31 +94,25 @@ export class Manus extends ToolCallAgent {
       specialToolNames: ['Terminate'],
     });
 
-    // 设置 MCP 客户端
-    if (options.mcpClient) {
-      this.mcpClient = options.mcpClient;
-    }
+    // MCP 客户端现在通过多智能体系统管理
 
     // 设置多智能体系统
     if (options.multiAgentSystem) {
       this.multiAgentSystem = options.multiAgentSystem;
 
       // 如果有多智能体系统，创建工具路由器
-      this.toolRouter = new ToolRouter(
-        this.multiAgentSystem.mcpManager,
-        this.multiAgentSystem.agentManager,
-        this.multiAgentSystem.decisionEngine,
-        {
-          strategy: 'hybrid', // 使用混合策略
-          mcpPriority: 0.6, // MCP优先级
-          a2aPriority: 0.4, // A2A优先级
-          loadBalanceThreshold: 0.8, // 负载均衡阈值
-          enableFallback: true, // 启用回退机制
-          maxRetries: 2, // 最大重试次数
-          timeoutMs: 30000, // 超时时间
-        },
-        this.logger
-      );
+      const mcpManager = this.multiAgentSystem.getMcpManager();
+      const agentManager = this.multiAgentSystem.getAgentManager();
+      const decisionEngine = this.multiAgentSystem.getDecisionEngine();
+
+      this.toolRouter = new ToolRouter(mcpManager, agentManager, decisionEngine, {
+        strategy: RoutingStrategy.HYBRID, // 使用混合策略
+        mcpPriority: 0.6, // MCP优先级
+        a2aPriority: 0.4, // A2A优先级
+        timeout: 30000, // 超时时间
+        retryCount: 2, // 重试次数
+        fallbackEnabled: true, // 启用回退机制
+      });
     }
 
     // 初始化任务状态
@@ -124,6 +120,8 @@ export class Manus extends ToolCallAgent {
       isTaskActive: false,
       taskContext: new Map<string, any>(),
       lastActiveTime: Date.now(),
+      completedSteps: [],
+      currentStepIndex: 0,
     };
   }
 
@@ -142,11 +140,112 @@ export class Manus extends ToolCallAgent {
       tools?: ToolCollection;
       useMcpServer?: boolean;
       continueTask?: boolean; // 新增参数，决定是否继续任务
-      mcpClient?: McpClient;
       multiAgentSystem?: MultiAgentSystem;
+      enableMultiAgent?: boolean; // 是否启用多智能体系统
     } = {}
   ): Promise<Manus> {
-    const instance = new Manus(options);
+    let multiAgentSystem = options.multiAgentSystem;
+
+    // 在多智能体系统初始化之前，先检查和处理 .manus 目录
+    const logger = new Logger('Manus');
+    const workspaceRoot = config.getWorkspaceRoot();
+    const manusDir = path.join(workspaceRoot, '.manus');
+
+    // 处理 .manus 目录
+    if (fs.existsSync(manusDir)) {
+      // 检查是否处于继续任务状态
+      const isContinuingTask = options.continueTask;
+
+      if (!isContinuingTask) {
+        // 如果不是继续任务，则备份目录
+        const backupDir = path.join(workspaceRoot, `.manus_backup_${Date.now()}`);
+        logger.info(`发现现有.manus目录，正在备份到 ${backupDir}`);
+        fs.cpSync(manusDir, backupDir, { recursive: true });
+
+        // 清空原目录
+        fs.rmSync(manusDir, { recursive: true, force: true });
+        fs.mkdirSync(manusDir, { recursive: true });
+      } else {
+        logger.info('继续执行任务，保留现有.manus目录');
+      }
+    } else {
+      // 创建.manus目录
+      fs.mkdirSync(manusDir, { recursive: true });
+    }
+
+    // .manus 目录处理完成，现在可以安全地进行后续初始化
+
+    // 如果启用多智能体系统且未提供实例，尝试创建
+    if (options.enableMultiAgent && !multiAgentSystem) {
+      try {
+        logger.info('正在从配置文件初始化多智能体系统...');
+
+        // 从配置文件读取MCP服务器和A2A代理配置
+        const mcpServersConfig = config.getMcpServersConfig();
+        const agentsConfig = config.getAgentsConfig();
+
+        if (mcpServersConfig.length > 0 || agentsConfig.length > 0) {
+          // 创建多智能体系统配置
+          const multiAgentConfig = {
+            mcp_services: mcpServersConfig,
+            a2a_agents: agentsConfig,
+            routing_rules: [],
+            memory_config: {
+              provider: 'local' as const,
+              local: {
+                storage_path: './.manus/memory',
+                max_file_size: 10485760,
+              },
+            },
+            task_management: {
+              max_concurrent_tasks: 5,
+              task_timeout: 300000,
+              priority_queue_size: 100,
+              interruption_policy: 'at_checkpoint' as const,
+              checkpoint_interval: 30000,
+              task_persistence: true,
+              auto_recovery: true,
+            },
+            decision_engine: {
+              strategy: 'hybrid' as const,
+              fallback_strategy: 'local' as const,
+              confidence_threshold: 0.7,
+              learning_enabled: false,
+              metrics_collection: true,
+            },
+            system: {
+              name: 'Manus-MultiAgent',
+              version: '2.0.0',
+              debug_mode: false,
+              log_level: 'info' as const,
+            },
+          };
+
+          // 创建多智能体系统
+          multiAgentSystem = new MultiAgentSystem(multiAgentConfig);
+
+          // 启动多智能体系统
+          await multiAgentSystem.start();
+
+          logger.info(
+            `多智能体系统启动成功: ${mcpServersConfig.length} 个MCP服务, ${agentsConfig.length} 个代理`
+          );
+        } else {
+          logger.info('配置文件中未找到MCP服务器或代理配置，将使用传统模式运行');
+          multiAgentSystem = undefined;
+        }
+      } catch (error) {
+        logger.error(`初始化多智能体系统失败: ${error}`);
+        logger.info('将使用传统模式运行');
+        multiAgentSystem = undefined;
+      }
+    }
+
+    const instance = new Manus({
+      ...options,
+      multiAgentSystem,
+    });
+
     await instance.initialize(options.useMcpServer, options.continueTask);
     return instance;
   }
@@ -158,34 +257,9 @@ export class Manus extends ToolCallAgent {
     useMcpServer: boolean = false,
     continueTask: boolean = false
   ): Promise<void> {
-    // 检查.manus目录
-    const workspaceRoot = config.getWorkspaceRoot();
-    const manusDir = path.join(workspaceRoot, '.manus');
-
-    if (fs.existsSync(manusDir)) {
-      // 尝试恢复任务状态
-      if (continueTask) {
-        this.loadTaskState();
-      }
-
-      // 检查是否处于继续任务状态
-      const isContinuingTask = this._taskState.isTaskActive && this._taskState.currentTask;
-
-      if (!isContinuingTask) {
-        // 如果不是继续任务，则备份目录
-        const backupDir = path.join(workspaceRoot, `.manus_backup_${Date.now()}`);
-        this.logger.info(`发现现有.manus目录，正在备份到 ${backupDir}`);
-        fs.cpSync(manusDir, backupDir, { recursive: true });
-
-        // 清空原目录
-        fs.rmSync(manusDir, { recursive: true, force: true });
-        fs.mkdirSync(manusDir, { recursive: true });
-      } else {
-        this.logger.info('继续执行任务，保留现有.manus目录');
-      }
-    } else {
-      // 创建.manus目录
-      fs.mkdirSync(manusDir, { recursive: true });
+    // 尝试恢复任务状态（如果需要）
+    if (continueTask) {
+      this.loadTaskState();
     }
 
     // MCP 服务器连接现在通过 MultiMcpManager 管理，不再在这里直接连接
@@ -219,9 +293,15 @@ export class Manus extends ToolCallAgent {
     const originalPrompt = this.nextStepPrompt;
 
     // 如果存在活跃任务，添加任务上下文到提示词
-    if (this._taskState.isTaskActive && this._taskState.currentTask) {
+    if (this._taskState.isTaskActive) {
       const taskContext = this.formatTaskContext();
       this.nextStepPrompt = `${taskContext}\n\n${originalPrompt}`;
+
+      // 如果有任务计划，优先执行当前步骤
+      const currentStep = this.getCurrentStep();
+      if (currentStep) {
+        this.nextStepPrompt = `${taskContext}\n\n当前需要执行的步骤: ${currentStep}\n\n${originalPrompt}`;
+      }
     }
 
     // 获取最近的消息
@@ -456,13 +536,137 @@ export class Manus extends ToolCallAgent {
   }
 
   /**
+   * 设置任务计划
+   */
+  public setTaskPlan(taskPlan: string[], originalDescription?: string, sourceFile?: string): void {
+    this._taskState.taskPlan = [...taskPlan];
+    this._taskState.currentStepIndex = 0;
+    this._taskState.completedSteps = [];
+    this._taskState.isTaskActive = true;
+    this._taskState.taskStartTime = Date.now();
+    this._taskState.lastActiveTime = Date.now();
+
+    if (originalDescription) {
+      this._taskState.originalTaskDescription = originalDescription;
+    }
+
+    if (sourceFile) {
+      this._taskState.taskSourceFile = sourceFile;
+    }
+
+    this.logger.info(`任务计划已设置，共 ${taskPlan.length} 个步骤`);
+    this.saveTaskState();
+  }
+
+  /**
+   * 获取当前任务计划
+   */
+  public getTaskPlan(): string[] {
+    return this._taskState.taskPlan || [];
+  }
+
+  /**
+   * 获取当前步骤
+   */
+  public getCurrentStep(): string | null {
+    if (!this._taskState.taskPlan || this._taskState.currentStepIndex === undefined) {
+      return null;
+    }
+
+    if (this._taskState.currentStepIndex < this._taskState.taskPlan.length) {
+      return this._taskState.taskPlan[this._taskState.currentStepIndex];
+    }
+
+    return null;
+  }
+
+  /**
+   * 标记当前步骤为完成
+   */
+  public markCurrentStepCompleted(): void {
+    if (!this._taskState.taskPlan || this._taskState.currentStepIndex === undefined) {
+      return;
+    }
+
+    const currentStep = this.getCurrentStep();
+    if (currentStep) {
+      this._taskState.completedSteps = this._taskState.completedSteps || [];
+      this._taskState.completedSteps.push(currentStep);
+      this._taskState.currentStepIndex++;
+      this._taskState.lastActiveTime = Date.now();
+
+      this.logger.info(`步骤已完成: ${currentStep}`);
+      this.logger.info(
+        `进度: ${this._taskState.currentStepIndex}/${this._taskState.taskPlan.length}`
+      );
+
+      // 检查是否所有步骤都已完成
+      if (this._taskState.currentStepIndex >= this._taskState.taskPlan.length) {
+        this._taskState.isTaskActive = false;
+        this.logger.info('所有任务步骤已完成！');
+      }
+
+      this.saveTaskState();
+    }
+  }
+
+  /**
+   * 获取任务进度信息
+   */
+  public getTaskProgress(): {
+    isActive: boolean;
+    totalSteps: number;
+    completedSteps: number;
+    currentStep: string | null;
+    progress: number;
+    completedStepsList: string[];
+  } {
+    const taskPlan = this._taskState.taskPlan || [];
+    const completedSteps = this._taskState.completedSteps || [];
+    const currentStepIndex = this._taskState.currentStepIndex || 0;
+
+    return {
+      isActive: this._taskState.isTaskActive || false,
+      totalSteps: taskPlan.length,
+      completedSteps: completedSteps.length,
+      currentStep: this.getCurrentStep(),
+      progress: taskPlan.length > 0 ? (completedSteps.length / taskPlan.length) * 100 : 0,
+      completedStepsList: [...completedSteps],
+    };
+  }
+
+  /**
+   * 从已保存的任务计划继续执行
+   */
+  public continueTaskExecution(): boolean {
+    if (!this._taskState.isTaskActive || !this._taskState.taskPlan) {
+      this.logger.warn('没有可继续的任务');
+      return false;
+    }
+
+    const progress = this.getTaskProgress();
+    if (progress.totalSteps === progress.completedSteps) {
+      this.logger.info('任务已全部完成');
+      return false;
+    }
+
+    this.logger.info(`继续执行任务，当前进度: ${progress.completedSteps}/${progress.totalSteps}`);
+    this.logger.info(`下一步: ${progress.currentStep}`);
+
+    return true;
+  }
+
+  /**
    * 保存任务状态到文件
    * 将当前任务状态持久化到.manus目录
    */
   private saveTaskState(): void {
     try {
       // 如果没有活跃任务，不需要保存
-      if (!this._taskState.isTaskActive || !this._taskState.currentTask) {
+      if (
+        !this._taskState.isTaskActive ||
+        (!this._taskState.currentTask && !this._taskState.taskPlan)
+      ) {
         return;
       }
 
@@ -487,11 +691,15 @@ export class Manus extends ToolCallAgent {
       // 准备要保存的状态数据
       const stateToSave = {
         currentTask: this._taskState.currentTask,
+        originalTaskDescription: this._taskState.originalTaskDescription,
         taskPlan: this._taskState.taskPlan,
         currentStepIndex: this._taskState.currentStepIndex,
+        completedSteps: this._taskState.completedSteps,
         taskContext: taskContextObj,
         lastActiveTime: Date.now(),
         isTaskActive: this._taskState.isTaskActive,
+        taskStartTime: this._taskState.taskStartTime,
+        taskSourceFile: this._taskState.taskSourceFile,
       };
 
       // 写入文件
@@ -552,11 +760,15 @@ export class Manus extends ToolCallAgent {
       // 恢复任务状态
       this._taskState = {
         currentTask: stateData.currentTask,
+        originalTaskDescription: stateData.originalTaskDescription,
         taskPlan: stateData.taskPlan,
         currentStepIndex: stateData.currentStepIndex,
+        completedSteps: stateData.completedSteps || [],
         taskContext,
         lastActiveTime: stateData.lastActiveTime,
         isTaskActive: stateData.isTaskActive,
+        taskStartTime: stateData.taskStartTime,
+        taskSourceFile: stateData.taskSourceFile,
       };
 
       this.logger.info(
@@ -700,15 +912,7 @@ export class Manus extends ToolCallAgent {
     // 保存当前任务状态
     // this.saveTaskState();
 
-    // 清理 MCP 资源
-    if (this.mcpClient) {
-      try {
-        // await this.mcpClient.disconnect(); // SDK 没有 disconnect 方法
-        this.mcpClient = undefined;
-      } catch (error) {
-        this.logger.error(`MCP 客户端断开连接失败: ${(error as Error).message}`);
-      }
-    }
+    // MCP 资源现在通过多智能体系统管理
 
     // 关闭 MCP 服务器进程
     if (this.mcpServerProcess) {

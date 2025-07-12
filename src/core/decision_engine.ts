@@ -321,8 +321,8 @@ export class DecisionEngine extends EventEmitter {
       if (this.hasRequiredCapabilities(task.requiredCapabilities, agent.capabilities)) {
         candidates.push({
           type: 'agent',
-          name: agent.name,
-          capabilities: agent.capabilities
+          name: agent.config.name,
+          capabilities: agent.capabilities,
         });
       }
     }
@@ -401,15 +401,15 @@ export class DecisionEngine extends EventEmitter {
     return {
       task,
       availableResources: {
-        mcpServices: mcpServices.map(s => s.name),
-        agents: agents.map(a => a.name)
+        mcpServices: mcpServices.map((s: any) => s.name),
+        agents: agents.map((a: any) => a.config.name),
       },
       systemLoad: {
         cpu: 0.5, // 简化实现
         memory: 0.6,
-        activeConnections: mcpServices.length + agents.length
+        activeConnections: mcpServices.length + agents.length,
       },
-      historicalPerformance: this.performanceHistory
+      historicalPerformance: this.performanceHistory,
     };
   }
 

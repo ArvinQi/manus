@@ -95,7 +95,7 @@ export class A2AAgentManager extends EventEmitter {
   private loadBalancingIndex = 0;
   private pendingTasks: Map<
     string,
-    { resolve: Function; reject: Function; timeout: NodeJS.Timeout }
+    { resolve: Function; reject: Function; timeout: NodeJS.Timeout; agentName: string }
   > = new Map();
 
   constructor() {
@@ -590,7 +590,7 @@ export class A2AAgentManager extends EventEmitter {
       }, taskRequest.timeout || agent.config.timeout);
 
       // 保存待处理任务
-      this.pendingTasks.set(message.id, { resolve, reject, timeout });
+      this.pendingTasks.set(message.id, { resolve, reject, timeout, agentName: agent.config.name });
 
       // 发送消息
       agent.wsConnection!.send(JSON.stringify(message));
@@ -661,7 +661,7 @@ export class A2AAgentManager extends EventEmitter {
 
       // 收集所有能力
       if (agent.capabilities) {
-        agent.capabilities.forEach(cap => allCapabilities.add(cap));
+        agent.capabilities.forEach((cap) => allCapabilities.add(cap));
       }
     }
 
@@ -843,7 +843,7 @@ export class A2AAgentManager extends EventEmitter {
    */
   async addAgent(config: A2AAgentConfig): Promise<void> {
     if (this.agents.has(config.name)) {
-      this.logger.warning(`A2A代理 ${config.name} 已存在，将被替换`);
+      this.logger.warn(`A2A代理 ${config.name} 已存在，将被替换`);
       await this.removeAgent(config.name);
     }
 
@@ -857,7 +857,7 @@ export class A2AAgentManager extends EventEmitter {
   async removeAgent(name: string): Promise<void> {
     const agent = this.agents.get(name);
     if (!agent) {
-      this.logger.warning(`尝试移除不存在的代理: ${name}`);
+      this.logger.warn(`尝试移除不存在的代理: ${name}`);
       return;
     }
 
@@ -897,6 +897,14 @@ export class A2AAgentManager extends EventEmitter {
    */
   getAgentNames(): string[] {
     return Array.from(this.agents.keys());
+  }
+
+  /**
+   * 检查代理是否可用
+   */
+  async isAgentAvailable(agentName: string): Promise<boolean> {
+    const agent = this.agents.get(agentName);
+    return agent ? agent.status === A2AAgentStatus.CONNECTED : false;
   }
 
   /**
@@ -956,11 +964,8 @@ export class A2AAgentManager extends EventEmitter {
         parameters: taskRequest.parameters,
         priority: 'medium',
         timeout: 30000,
-        retryCount: 0,
-        metadata: {
-          source: 'manus_system',
-          timestamp: Date.now(),
-        },
+        requiredCapabilities: taskRequest.requiredCapabilities || [],
+        context: taskRequest.context,
       };
 
       // 发送任务请求

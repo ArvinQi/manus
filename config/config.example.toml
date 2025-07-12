@@ -49,4 +49,4 @@ country = "cn"
 
 # 工作空间配置
 [workspace]
-root = "./workspace"
+root = "."

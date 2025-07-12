@@ -624,7 +624,7 @@ export class PlanningTool extends BaseTool {
         } else {
           this.plans = {};
           this._current_plan_id = null;
-          this.logger.warning('计划文件格式不正确，初始化空计划');
+          this.logger.warn('计划文件格式不正确，初始化空计划');
         }
       } catch (parseError) {
         this.logger.error(`解析计划文件失败: ${parseError}`);

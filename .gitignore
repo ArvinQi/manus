@@ -2,7 +2,7 @@
 node_modules/
 
 # Build output
-dist/
+# dist/
 
 # Environment variables
 .env
@@ -11,6 +11,7 @@ dist/
 .env.test.local
 .env.production.local
 config.toml
+config.json
 
 # Logs
 logs

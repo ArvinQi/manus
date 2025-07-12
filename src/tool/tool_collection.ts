@@ -107,7 +107,7 @@ export class ToolCollection {
    */
   addTool(tool: BaseTool): this {
     if (this.toolMap[tool.name]) {
-      this.logger.warning(`工具 ${tool.name} 已存在于集合中，跳过`);
+      this.logger.warn(`工具 ${tool.name} 已存在于集合中，跳过`);
       return this;
     }
 

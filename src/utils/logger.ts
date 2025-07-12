@@ -66,7 +66,7 @@ export class Logger {
   /**
    * 记录警告级别日志
    */
-  warning(message: string, ...args: unknown[]): void {
+  warn(message: string, ...args: unknown[]): void {
     if (this.useConsole) {
       this.logger.warn(this.formatMessage(message), ...args);
     }

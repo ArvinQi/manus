@@ -223,7 +223,7 @@ export class ToolCallAgent extends ReActAgent {
       this._originalMessages = [];
       return true;
     }
-    this.logger.warning('⚠️ 没有可恢复的原始消息历史');
+    this.logger.warn('⚠️ 没有可恢复的原始消息历史');
     return false;
   }
 
@@ -244,6 +244,7 @@ export class ToolCallAgent extends ReActAgent {
         systemMsgs: this.systemPrompt ? [Message.systemMessage(this.systemPrompt)] : undefined,
         tools: this.availableTools.toParams(),
         toolChoice: this.toolChoice,
+        currentQuery: this.extractCurrentQuery(),
       });
 
       // 保存工具调用
@@ -269,7 +270,7 @@ export class ToolCallAgent extends ReActAgent {
         // 处理不同的工具选择模式
         if (this.toolChoice === ToolChoice.NONE) {
           if (this.toolCalls.length > 0) {
-            this.logger.warning(`🤔 嗯，${this.name} 尝试使用不可用的工具！`);
+            this.logger.warn(`🤔 嗯，${this.name} 尝试使用不可用的工具！`);
           }
           if (content) {
             this.memory.addMessage(Message.assistantMessage(content));

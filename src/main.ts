@@ -9,6 +9,7 @@ import { PlanningAgent } from './agent/planning.js';
 import { FlowFactory, FlowType } from './flow/flow_factory.js';
 import { Logger } from './utils/logger.js';
 import * as readline from 'readline';
+import * as fs from 'fs';
 import path from 'path';
 
 // 增加process对象的最大监听器数量，避免内存泄漏警告
@@ -22,12 +23,21 @@ const logger = new Logger('Main');
  */
 export async function main() {
   const continueTask = process.argv.includes('--continue');
-  const useMcpServer = process.argv.includes('--use-mcp-server');
-  const maxSteps = parseInt(process.argv[3], 10) || 30;
+  // const useMcpServer = process.argv.includes('--use-mcp-server');
+  const maxSteps = parseInt(process.argv[3], 10) || 100;
+
+  // 检查是否指定了MD文件
+  const fileArgIndex = process.argv.indexOf('--file');
+  const taskFile = fileArgIndex !== -1 ? process.argv[fileArgIndex + 1] : null;
 
   // 创建并初始化代理
   const agents: Record<string, any> = {
-    manus: await Manus.create({ maxSteps, useMcpServer, continueTask }),
+    manus: await Manus.create({
+      maxSteps,
+      // useMcpServer,
+      continueTask,
+      enableMultiAgent: true, // 默认启用多智能体系统
+    }),
   };
 
   // 等待1秒
@@ -36,16 +46,40 @@ export async function main() {
   }
 
   try {
-    // 获取用户输入
-    const prompt = process.argv[2] || (await getUserInput('请输入你的指令: \n'));
+    // 获取用户输入或从文件读取
+    let prompt: string;
+
+    if (taskFile) {
+      // 从MD文件读取任务描述
+      if (!fs.existsSync(taskFile)) {
+        logger.error(`指定的任务文件不存在: ${taskFile}`);
+        return;
+      }
+
+      try {
+        prompt = fs.readFileSync(taskFile, 'utf-8');
+        logger.info(`从文件读取任务描述: ${taskFile}`);
+      } catch (error) {
+        logger.error(`读取任务文件失败: ${error}`);
+        return;
+      }
+    } else {
+      // 从命令行参数或交互式输入获取
+      prompt = process.argv[2] || (await getUserInput('请输入你的指令: \n'));
+    }
 
     if (!prompt.trim()) {
-      logger.warning('提供了空指令。');
+      logger.warn('提供了空指令。');
       return;
     }
 
-    logger.info('请求内容：' + prompt);
-    logger.warning('正在处理你的请求...');
+    logger.info(
+      '请求内容：' +
+        (taskFile ? `[来自文件: ${taskFile}]` : '') +
+        prompt.substring(0, 100) +
+        (prompt.length > 100 ? '...' : '')
+    );
+    logger.warn('正在处理你的请求...');
 
     // 使用流程工厂创建规划流程
     // const flow = FlowFactory.createFlow({
@@ -57,6 +91,18 @@ export async function main() {
       // 记录开始时间
       const startTime = Date.now();
 
+      // 检查是否需要继续执行已有任务
+      if (continueTask) {
+        const canContinue = agents.manus.continueTaskExecution();
+        if (canContinue) {
+          logger.info('继续执行已保存的任务计划...');
+          const taskProgress = agents.manus.getTaskProgress();
+          logger.info(
+            `任务进度: ${taskProgress.completedSteps}/${taskProgress.totalSteps} (${taskProgress.progress.toFixed(1)}%)`
+          );
+        }
+      }
+
       // 执行流程
       // const result = await flow.execute(prompt);
       const result = await agents.manus.run(prompt);
@@ -66,7 +112,6 @@ export async function main() {
       logger.info(`请求处理完成，耗时 ${elapsedTime.toFixed(2)} 秒`);
       logger.info(result);
     } catch (error) {
-      console.log('🚀🚀🚀🚀🚀🚀 ~ file: main.ts:69 ~ main ~ error:', error);
       logger.error('请求处理超时');
       logger.info('由于超时，操作已终止。请尝试一个更简单的请求。');
     }

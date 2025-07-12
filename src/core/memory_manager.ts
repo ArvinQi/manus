@@ -12,15 +12,12 @@ import { MultiMcpManager } from '../mcp/multi_mcp_manager.js';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
-// 记忆类型
+// 记忆类型 - 简化为只记录有价值的信息
 export enum MemoryType {
-  TASK_SUBMISSION = 'task_submission',
-  TASK_EXECUTION = 'task_execution',
-  TASK_COMPLETION = 'task_completion',
-  DECISION_MAKING = 'decision_making',
-  SYSTEM_EVENT = 'system_event',
-  USER_INTERACTION = 'user_interaction',
-  ERROR_EVENT = 'error_event'
+  CONVERSATION = 'conversation', // 对话记录（用户输入、AI回复）
+  TOOL_OPERATION = 'tool_operation', // 工具操作（工具调用、结果）
+  CRITICAL_ERROR = 'critical_error', // 关键错误（需要关注的错误）
+  IMPORTANT_EVENT = 'important_event', // 重要事件（系统状态变化等）
 }
 
 // 记忆条目
@@ -108,7 +105,6 @@ export class MemoryManager extends EventEmitter {
 
       this.isInitialized = true;
       this.emit('initialized');
-
     } catch (error) {
       this.logger.error(`记忆管理器初始化失败: ${error}`);
       throw error;
@@ -149,162 +145,183 @@ export class MemoryManager extends EventEmitter {
   }
 
   /**
-   * 记录任务提交
+   * 记录对话（用户输入和AI回复）
    */
-  async recordTaskSubmission(task: Task): Promise<void> {
+  async recordConversation(
+    role: 'user' | 'assistant',
+    content: string,
+    metadata?: any
+  ): Promise<void> {
+    // 过滤掉过长或无意义的内容
+    if (!content || content.length < 5 || content.length > 10000) {
+      return;
+    }
+
     const entry: MemoryEntry = {
-      id: `task_submit_${task.id}_${Date.now()}`,
-      type: MemoryType.TASK_SUBMISSION,
+      id: `conversation_${role}_${Date.now()}`,
+      type: MemoryType.CONVERSATION,
       timestamp: Date.now(),
       content: {
-        taskId: task.id,
-        taskType: task.type,
-        description: task.description,
-        priority: task.priority,
-        requiredCapabilities: task.requiredCapabilities
+        role,
+        message: content,
+        metadata,
       },
-      importance: this.calculateImportance(task.priority),
-      tags: ['task', 'submission', task.type, task.priority],
-      context: task.context
+      importance: role === 'user' ? 0.8 : 0.6, // 用户输入更重要
+      tags: ['conversation', role],
+      context: metadata,
     };
 
     await this.storeMemory(entry);
   }
 
   /**
-   * 记录任务执行
+   * 记录工具操作（工具调用和结果）
    */
-  async recordTaskExecution(task: Task, decision: DecisionResult): Promise<void> {
+  async recordToolOperation(
+    toolName: string,
+    args: any,
+    result: any,
+    success: boolean,
+    executionTime?: number
+  ): Promise<void> {
+    // 过滤掉不重要的工具操作
+    const ignoredTools = ['Terminate', 'Ask', 'Debug'];
+    if (ignoredTools.includes(toolName)) {
+      return;
+    }
+
     const entry: MemoryEntry = {
-      id: `task_exec_${task.id}_${Date.now()}`,
-      type: MemoryType.TASK_EXECUTION,
+      id: `tool_${toolName}_${Date.now()}`,
+      type: MemoryType.TOOL_OPERATION,
       timestamp: Date.now(),
       content: {
-        taskId: task.id,
-        decision: {
-          targetType: decision.targetType,
-          targetName: decision.targetName,
-          confidence: decision.confidence,
-          reasoning: decision.reasoning
-        },
-        startTime: Date.now()
+        toolName,
+        args: this.sanitizeArgs(args), // 清理敏感信息
+        result: this.sanitizeResult(result),
+        success,
+        executionTime,
       },
-      importance: this.calculateImportance(task.priority),
-      tags: ['task', 'execution', decision.targetType, decision.targetName],
-      context: { taskType: task.type }
+      importance: success ? 0.6 : 0.8, // 失败的操作更重要
+      tags: ['tool', toolName, success ? 'success' : 'failure'],
+      context: { toolName, success },
     };
 
     await this.storeMemory(entry);
   }
 
   /**
-   * 记录任务完成
+   * 记录关键错误
    */
-  async recordTaskCompletion(task: Task, result: TaskResult): Promise<void> {
-    const entry: MemoryEntry = {
-      id: `task_complete_${task.id}_${Date.now()}`,
-      type: MemoryType.TASK_COMPLETION,
-      timestamp: Date.now(),
-      content: {
-        taskId: task.id,
-        status: result.status,
-        executionTime: result.executionTime,
-        executedBy: result.executedBy,
-        success: result.status === 'completed',
-        error: result.error
-      },
-      importance: result.status === 'completed' ? 0.8 : 0.9, // 失败的任务重要性更高
-      tags: ['task', 'completion', result.status, result.executedBy],
-      context: { taskType: task.type }
-    };
+  async recordCriticalError(error: Error, context: any): Promise<void> {
+    // 只记录真正关键的错误，过滤掉一些常见的非关键错误
+    const criticalPatterns = ['ECONNREFUSED', 'TIMEOUT', 'UNAUTHORIZED', 'CRASH', 'FATAL'];
+    const isCritical = criticalPatterns.some(
+      (pattern) =>
+        error.message.toUpperCase().includes(pattern) || error.name.toUpperCase().includes(pattern)
+    );
 
-    await this.storeMemory(entry);
-  }
+    if (!isCritical) {
+      return;
+    }
 
-  /**
-   * 记录决策制定
-   */
-  async recordDecision(task: Task, decision: DecisionResult, context: any): Promise<void> {
-    const entry: MemoryEntry = {
-      id: `decision_${task.id}_${Date.now()}`,
-      type: MemoryType.DECISION_MAKING,
-      timestamp: Date.now(),
-      content: {
-        taskId: task.id,
-        decision,
-        context,
-        reasoning: decision.reasoning
-      },
-      importance: 0.7,
-      tags: ['decision', decision.targetType, decision.targetName],
-      context: { confidence: decision.confidence }
-    };
-
-    await this.storeMemory(entry);
-  }
-
-  /**
-   * 记录系统事件
-   */
-  async recordSystemEvent(event: string, details: any, importance: number = 0.5): Promise<void> {
-    const entry: MemoryEntry = {
-      id: `system_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      type: MemoryType.SYSTEM_EVENT,
-      timestamp: Date.now(),
-      content: {
-        event,
-        details
-      },
-      importance,
-      tags: ['system', event],
-      context: details
-    };
-
-    await this.storeMemory(entry);
-  }
-
-  /**
-   * 记录用户交互
-   */
-  async recordUserInteraction(interaction: string, details: any): Promise<void> {
-    const entry: MemoryEntry = {
-      id: `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      type: MemoryType.USER_INTERACTION,
-      timestamp: Date.now(),
-      content: {
-        interaction,
-        details
-      },
-      importance: 0.8, // 用户交互通常比较重要
-      tags: ['user', 'interaction'],
-      context: details
-    };
-
-    await this.storeMemory(entry);
-  }
-
-  /**
-   * 记录错误事件
-   */
-  async recordError(error: Error, context: any): Promise<void> {
     const entry: MemoryEntry = {
       id: `error_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-      type: MemoryType.ERROR_EVENT,
+      type: MemoryType.CRITICAL_ERROR,
       timestamp: Date.now(),
       content: {
         error: {
           name: error.name,
           message: error.message,
-          stack: error.stack
+          stack: error.stack?.substring(0, 500), // 限制堆栈长度
         },
-        context
+        context: this.sanitizeContext(context),
       },
-      importance: 0.9, // 错误事件重要性很高
-      tags: ['error', error.name],
-      context
+      importance: 0.9,
+      tags: ['error', 'critical', error.name],
+      context: { errorType: error.name },
     };
 
     await this.storeMemory(entry);
+  }
+
+  /**
+   * 记录重要事件（系统状态变化等）
+   */
+  async recordImportantEvent(event: string, details: any, importance: number = 0.7): Promise<void> {
+    // 只记录真正重要的事件
+    const importantEvents = [
+      'system_start',
+      'system_shutdown',
+      'config_change',
+      'service_failure',
+      'recovery',
+    ];
+    if (!importantEvents.includes(event)) {
+      return;
+    }
+
+    const entry: MemoryEntry = {
+      id: `event_${event}_${Date.now()}`,
+      type: MemoryType.IMPORTANT_EVENT,
+      timestamp: Date.now(),
+      content: {
+        event,
+        details: this.sanitizeContext(details),
+      },
+      importance,
+      tags: ['event', event],
+      context: { eventType: event },
+    };
+
+    await this.storeMemory(entry);
+  }
+
+  /**
+   * 清理参数中的敏感信息
+   */
+  private sanitizeArgs(args: any): any {
+    if (!args || typeof args !== 'object') return args;
+
+    const sanitized = { ...args };
+    const sensitiveKeys = ['password', 'token', 'key', 'secret', 'credential'];
+
+    for (const key of Object.keys(sanitized)) {
+      if (sensitiveKeys.some((sensitive) => key.toLowerCase().includes(sensitive))) {
+        sanitized[key] = '[REDACTED]';
+      }
+    }
+
+    return sanitized;
+  }
+
+  /**
+   * 清理结果中的冗余信息
+   */
+  private sanitizeResult(result: any): any {
+    if (!result) return result;
+
+    // 如果结果太大，只保留摘要
+    const resultStr = typeof result === 'string' ? result : JSON.stringify(result);
+    if (resultStr.length > 1000) {
+      return {
+        summary: resultStr.substring(0, 200) + '...',
+        length: resultStr.length,
+        type: typeof result,
+      };
+    }
+
+    return result;
+  }
+
+  /**
+   * 清理上下文信息
+   */
+  private sanitizeContext(context: any): any {
+    if (!context) return context;
+
+    // 移除一些不必要的字段
+    const { stack, debug, verbose, ...cleanContext } = context;
+    return cleanContext;
   }
 
   /**
@@ -337,13 +354,13 @@ export class MemoryManager extends EventEmitter {
       tags: entry.tags,
       timeRange: {
         start: entry.timestamp - 3600000, // 前后1小时
-        end: entry.timestamp + 3600000
+        end: entry.timestamp + 3600000,
       },
-      limit
+      limit,
     };
 
     const related = await this.queryMemories(query);
-    return related.filter(r => r.id !== entryId);
+    return related.filter((r) => r.id !== entryId);
   }
 
   /**
@@ -351,7 +368,7 @@ export class MemoryManager extends EventEmitter {
    */
   async compressMemories(): Promise<void> {
     if (this.config.provider !== 'openmemory') {
-      this.logger.warning('记忆压缩仅支持OpenMemory提供者');
+      this.logger.warn('记忆压缩仅支持OpenMemory提供者');
       return;
     }
 
@@ -370,11 +387,11 @@ export class MemoryManager extends EventEmitter {
         importance: { min: 0, max: 0.5 },
         timeRange: {
           start: 0,
-          end: Date.now() - 86400000 // 24小时前
+          end: Date.now() - 86400000, // 24小时前
         },
         limit: 100,
         sortBy: 'timestamp',
-        sortOrder: 'asc'
+        sortOrder: 'asc',
       };
 
       const toCompress = await this.queryMemories(query);
@@ -383,7 +400,6 @@ export class MemoryManager extends EventEmitter {
         await this.performCompression(toCompress);
         this.logger.info(`压缩了 ${toCompress.length} 条记忆`);
       }
-
     } catch (error) {
       this.logger.error(`记忆压缩失败: ${error}`);
     }
@@ -397,7 +413,7 @@ export class MemoryManager extends EventEmitter {
       importance: { min: 0.8, max: 1.0 },
       limit: 50,
       sortBy: 'importance',
-      sortOrder: 'desc'
+      sortOrder: 'desc',
     };
 
     return await this.queryMemories(query);
@@ -409,15 +425,15 @@ export class MemoryManager extends EventEmitter {
   async saveCheckpoint(taskId: string, checkpoint: TaskCheckpoint): Promise<void> {
     const entry: MemoryEntry = {
       id: `checkpoint_${checkpoint.id}`,
-      type: MemoryType.SYSTEM_EVENT,
+      type: MemoryType.IMPORTANT_EVENT,
       timestamp: checkpoint.timestamp,
       content: {
         taskId,
-        checkpoint
+        checkpoint,
       },
       importance: 0.9, // 检查点很重要
       tags: ['checkpoint', 'task', taskId],
-      context: { canResume: checkpoint.canResume }
+      context: { canResume: checkpoint.canResume },
     };
 
     await this.storeMemory(entry);
@@ -430,37 +446,21 @@ export class MemoryManager extends EventEmitter {
     const query: MemoryQuery = {
       tags: ['checkpoint'],
       sortBy: 'timestamp',
-      sortOrder: 'desc'
+      sortOrder: 'desc',
     };
 
     const entries = await this.queryMemories(query);
-    return entries.map(entry => entry.content.checkpoint).filter(Boolean);
+    return entries.map((entry) => entry.content.checkpoint).filter(Boolean);
   }
 
   /**
-   * 根据ID获取任务
+   * 根据ID获取任务（已弃用）
    */
   async getTaskById(taskId: string): Promise<Task | null> {
-    const query: MemoryQuery = {
-      types: [MemoryType.TASK_SUBMISSION],
-      tags: ['task', taskId]
-    };
-
-    const entries = await this.queryMemories(query);
-    if (entries.length === 0) {
-      return null;
-    }
-
-    const entry = entries[0];
-    return {
-      id: entry.content.taskId,
-      type: entry.content.taskType,
-      description: entry.content.description,
-      priority: entry.content.priority,
-      requiredCapabilities: entry.content.requiredCapabilities,
-      context: entry.context,
-      createdAt: entry.timestamp
-    };
+    // 简化实现：不再从记忆中查找任务信息
+    // 任务信息应该由任务管理器维护，而不是记忆管理器
+    this.logger.warn('getTaskById已弃用，请使用TaskManager获取任务信息');
+    return null;
   }
 
   /**
@@ -503,7 +503,7 @@ export class MemoryManager extends EventEmitter {
         content: JSON.stringify(entry.content),
         importance: entry.importance,
         tags: entry.tags,
-        context: entry.context ? JSON.stringify(entry.context) : undefined
+        context: entry.context ? JSON.stringify(entry.context) : undefined,
       });
     } catch (error) {
       this.logger.error(`存储到OpenMemory失败: ${error}`);
@@ -544,7 +544,7 @@ export class MemoryManager extends EventEmitter {
         importance_range: query.importance,
         limit: query.limit,
         sort_by: query.sortBy,
-        sort_order: query.sortOrder
+        sort_order: query.sortOrder,
       });
 
       return result.memories || [];
@@ -600,7 +600,7 @@ export class MemoryManager extends EventEmitter {
     }
 
     // 检查标签
-    if (query.tags && !query.tags.some(tag => entry.tags.includes(tag))) {
+    if (query.tags && !query.tags.some((tag) => entry.tags.includes(tag))) {
       return false;
     }
 
@@ -653,7 +653,7 @@ export class MemoryManager extends EventEmitter {
     const query: MemoryQuery = { limit: 1 };
     const entries = await this.queryMemories(query);
 
-    return entries.find(entry => entry.id === id) || null;
+    return entries.find((entry) => entry.id === id) || null;
   }
 
   /**
@@ -674,7 +674,7 @@ export class MemoryManager extends EventEmitter {
       try {
         const storagePath = this.config.local?.storage_path || './.manus/memory';
         const files = await fs.readdir(storagePath);
-        return files.filter(file => file.endsWith('.json')).length;
+        return files.filter((file) => file.endsWith('.json')).length;
       } catch (error) {
         return 0;
       }
@@ -690,7 +690,7 @@ export class MemoryManager extends EventEmitter {
 
       try {
         await this.mcpManager!.callTool(mcpName, 'compress_memories', {
-          entry_ids: entries.map(e => e.id)
+          entry_ids: entries.map((e) => e.id),
         });
       } catch (error) {
         this.logger.error(`OpenMemory压缩失败: ${error}`);
@@ -704,10 +704,10 @@ export class MemoryManager extends EventEmitter {
    */
   private calculateImportance(priority: string): number {
     const priorityMap: Record<string, number> = {
-      'low': 0.3,
-      'medium': 0.5,
-      'high': 0.7,
-      'urgent': 0.9
+      low: 0.3,
+      medium: 0.5,
+      high: 0.7,
+      urgent: 0.9,
     };
 
     return priorityMap[priority] || 0.5;
@@ -720,7 +720,7 @@ export class MemoryManager extends EventEmitter {
     // 定期压缩
     const compressionInterval = this.config.openmemory?.extraction_interval || 3600000;
     this.compressionInterval = setInterval(() => {
-      this.compressMemories().catch(error => {
+      this.compressMemories().catch((error) => {
         this.logger.error(`定期压缩失败: ${error}`);
       });
     }, compressionInterval);
@@ -757,13 +757,10 @@ export class MemoryManager extends EventEmitter {
     const allEntries = await this.queryMemories({ limit: 10000 });
 
     const entriesByType: Record<MemoryType, number> = {
-      [MemoryType.TASK_SUBMISSION]: 0,
-      [MemoryType.TASK_EXECUTION]: 0,
-      [MemoryType.TASK_COMPLETION]: 0,
-      [MemoryType.DECISION_MAKING]: 0,
-      [MemoryType.SYSTEM_EVENT]: 0,
-      [MemoryType.USER_INTERACTION]: 0,
-      [MemoryType.ERROR_EVENT]: 0
+      [MemoryType.CONVERSATION]: 0,
+      [MemoryType.TOOL_OPERATION]: 0,
+      [MemoryType.CRITICAL_ERROR]: 0,
+      [MemoryType.IMPORTANT_EVENT]: 0,
     };
 
     let totalImportance = 0;
@@ -772,7 +769,9 @@ export class MemoryManager extends EventEmitter {
     let newestTimestamp = 0;
 
     for (const entry of allEntries) {
-      entriesByType[entry.type]++;
+      if (entriesByType[entry.type] !== undefined) {
+        entriesByType[entry.type]++;
+      }
       totalImportance += entry.importance;
 
       if (entry.compressed) {
@@ -795,7 +794,7 @@ export class MemoryManager extends EventEmitter {
       averageImportance: allEntries.length > 0 ? totalImportance / allEntries.length : 0,
       oldestEntry: oldestTimestamp,
       newestEntry: newestTimestamp,
-      storageSize: 0 // 简化实现
+      storageSize: 0, // 简化实现
     };
   }
 
