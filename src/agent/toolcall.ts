@@ -28,6 +28,9 @@ export class ToolCallAgent extends ReActAgent {
   // 当前工具调用
   toolCalls: ToolCall[];
 
+  // 已处理的工具调用ID集合，用于防止重复处理
+  private processedToolCallIds: Set<string> = new Set();
+
   // 当前 base64 图像
   private _currentBase64Image?: string;
 
@@ -238,14 +241,23 @@ export class ToolCallAgent extends ReActAgent {
     }
 
     try {
+      // 获取当前查询用于上下文获取
+      const currentQuery = this.extractCurrentQuery();
+
+      // 使用Agent的智能上下文管理获取相关消息
+      const contextualMessages = await this.getContextualMessages(currentQuery);
+
       // 获取带工具选项的响应
       const response = await this.llm.askTool({
-        messages: this.messages,
+        messages: contextualMessages,
         systemMsgs: this.systemPrompt ? [Message.systemMessage(this.systemPrompt)] : undefined,
         tools: this.availableTools.toParams(),
         toolChoice: this.toolChoice,
-        currentQuery: this.extractCurrentQuery(),
+        currentQuery: currentQuery,
       });
+
+      // 保存对话到记忆系统
+      await this.saveConversationToMemory(contextualMessages, response);
 
       // 保存工具调用
       this.toolCalls = response.tool_calls || [];
@@ -317,6 +329,14 @@ export class ToolCallAgent extends ReActAgent {
   }
 
   /**
+   * 清除已处理的工具调用ID
+   */
+  clearProcessedToolCalls(): void {
+    this.processedToolCallIds.clear();
+    this.logger.debug('Cleared processed tool call IDs');
+  }
+
+  /**
    * 行动过程
    * 执行工具调用并处理结果
    */
@@ -333,6 +353,12 @@ export class ToolCallAgent extends ReActAgent {
 
     const results: string[] = [];
     for (const command of this.toolCalls) {
+      // 检查是否已经处理过这个工具调用
+      if (this.processedToolCallIds.has(command.id)) {
+        this.logger.warn(`Skipping already processed tool call: ${command.id}`);
+        continue;
+      }
+
       // 重置每个工具调用的 base64 图像
       this._currentBase64Image = undefined;
 
@@ -349,6 +375,9 @@ export class ToolCallAgent extends ReActAgent {
       });
 
       this.memory.addMessage(toolMsg);
+
+      // 标记这个工具调用已被处理
+      this.processedToolCallIds.add(command.id);
 
       // 如果存在原始消息备份，也更新原始消息历史
       // 这确保了在摘要处理后，原始消息历史仍然包含完整的对话
@@ -462,5 +491,13 @@ export class ToolCallAgent extends ReActAgent {
         this.state = AgentState.FINISHED;
       }
     }
+  }
+
+  /**
+   * 重写清理方法，清除处理过的工具调用ID
+   */
+  async cleanup(): Promise<void> {
+    await super.cleanup();
+    this.clearProcessedToolCalls();
   }
 }

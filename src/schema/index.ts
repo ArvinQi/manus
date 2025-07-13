@@ -133,11 +133,21 @@ export class Message {
  */
 export class Memory {
   messages: Message[] = [];
+  private addedToolResults: Set<string> = new Set();
 
   /**
    * 添加消息到内存
    */
   addMessage(message: Message): void {
+    // 如果是工具结果消息，检查是否已经添加过相同的 tool_call_id
+    if (message.tool_call_id) {
+      if (this.addedToolResults.has(message.tool_call_id)) {
+        console.warn(`Skipping duplicate tool result: ${message.tool_call_id}`);
+        return; // 跳过重复的工具结果
+      }
+      this.addedToolResults.add(message.tool_call_id);
+    }
+
     this.messages.push(message);
   }
 
@@ -146,5 +156,6 @@ export class Memory {
    */
   clear(): void {
     this.messages = [];
+    this.addedToolResults.clear();
   }
 }

@@ -6,10 +6,6 @@
 import { Logger } from '../utils/logger.js';
 import { AgentState, Memory, Message, Role } from '../schema/index.js';
 import { Mem0MemoryManager, MemoryConfig } from '../core/mem0_memory_manager.js';
-import {
-  ConversationContextManager,
-  ConversationConfig,
-} from '../core/conversation_context_manager.js';
 import { config } from '../utils/config.js';
 
 export abstract class BaseAgent {
@@ -25,7 +21,6 @@ export abstract class BaseAgent {
   memory: Memory;
   state: AgentState;
   memoryManager?: Mem0MemoryManager;
-  conversationManager?: ConversationContextManager;
 
   // 执行控制
   maxSteps: number;
@@ -42,7 +37,6 @@ export abstract class BaseAgent {
     maxSteps?: number;
     memoryConfig?: MemoryConfig;
     userId?: string;
-    conversationConfig?: ConversationConfig;
   }) {
     this.name = options.name;
     this.description = options.description;
@@ -66,26 +60,6 @@ export abstract class BaseAgent {
       } catch (error) {
         this.logger.error(`Failed to initialize memory manager for ${this.name}: ${error}`);
       }
-    }
-
-    // 获取对话配置（优先使用传入的配置，否则从配置文件读取）
-    const finalConversationConfig = options.conversationConfig || config.getConversationConfig();
-
-    // 初始化对话上下文管理器（默认启用）
-    try {
-      // 如果没有记忆管理器，创建一个默认的记忆管理器
-      const memMgr =
-        this.memoryManager ||
-        (finalMemoryConfig.enabled
-          ? new Mem0MemoryManager(finalMemoryConfig, options.userId)
-          : undefined);
-      this.conversationManager = new ConversationContextManager(
-        finalConversationConfig,
-        memMgr as any
-      );
-      this.logger.info(`${this.name} initialized with intelligent conversation context management`);
-    } catch (error) {
-      this.logger.error(`Failed to initialize conversation manager for ${this.name}: ${error}`);
     }
   }
 
@@ -112,28 +86,6 @@ export abstract class BaseAgent {
   }
 
   /**
-   * 获取对话上下文管理器
-   */
-  getConversationManager(): ConversationContextManager | undefined {
-    return this.conversationManager;
-  }
-
-  /**
-   * 设置对话上下文管理器
-   */
-  setConversationManager(conversationManager: ConversationContextManager): void {
-    this.conversationManager = conversationManager;
-    this.logger.info(`Conversation context manager updated for ${this.name}`);
-  }
-
-  /**
-   * 检查是否启用了对话上下文管理
-   */
-  isConversationContextEnabled(): boolean {
-    return this.conversationManager !== undefined;
-  }
-
-  /**
    * 安全地转换代理状态
    * @param newState 要转换到的新状态
    * @param callback 在新状态下执行的回调函数
@@ -148,96 +100,224 @@ export abstract class BaseAgent {
 
     try {
       return await callback();
-    } catch (error) {
-      this.state = AgentState.ERROR;
-      throw error;
     } finally {
       this.state = previousState;
     }
   }
 
   /**
-   * 更新代理的内存
-   * @param role 消息发送者的角色
-   * @param content 消息内容
-   * @param options 附加选项
+   * 添加消息到内存，支持Base64图像
+   * @param role 角色
+   * @param content 内容
+   * @param options 可选参数
    */
   updateMemory(
     role: Role,
     content: string,
     options?: { base64Image?: string; [key: string]: any }
   ): void {
-    const messageMap: Record<Role, (content: string, options?: any) => Message> = {
-      [Role.USER]: Message.userMessage,
-      [Role.SYSTEM]: Message.systemMessage,
-      [Role.ASSISTANT]: Message.assistantMessage,
-      [Role.TOOL]: (content: string, options?: any) => Message.toolMessage(content, options),
-    };
-
-    if (!messageMap[role]) {
-      throw new Error(`不支持的消息角色: ${role}`);
-    }
-
-    // 根据角色创建消息
-    const message = messageMap[role](content, options);
+    const message = new Message({ role, content, ...options });
     this.memory.addMessage(message);
+  }
 
-    const metadata = {
-      role,
-      timestamp: new Date().toISOString(),
-      agentName: this.name,
-      ...options,
-    };
+  /**
+   * 确保工具调用配对完整性
+   * 每个 tool_use 必须有对应的 tool_result
+   */
+  private ensureToolCallIntegrity(messages: Message[]): Message[] {
+    const result: Message[] = [];
+    const addedToolResults = new Set<string>();
 
-    // 添加到对话上下文管理器（如果启用）
-    if (this.conversationManager) {
-      this.conversationManager.addMessage(message, metadata).catch((error) => {
-        this.logger.error(`Failed to add message to conversation manager: ${error}`);
-      });
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      result.push(message);
+
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        const toolCallIds = message.tool_calls.map((call) => call.id);
+
+        for (let j = i + 1; j < messages.length; j++) {
+          const nextMessage = messages[j];
+
+          if (
+            nextMessage.tool_call_id &&
+            toolCallIds.includes(nextMessage.tool_call_id) &&
+            !addedToolResults.has(nextMessage.tool_call_id)
+          ) {
+            if (!result.includes(nextMessage)) {
+              result.push(nextMessage);
+              addedToolResults.add(nextMessage.tool_call_id);
+            }
+          }
+        }
+      }
     }
 
-    // 如果启用了记忆管理，也添加到记忆管理器
-    if (this.isMemoryEnabled()) {
-      this.memoryManager?.addMemory(content, metadata).catch((error) => {
-        this.logger.error(`Failed to add memory: ${error}`);
-      });
+    return result;
+  }
+
+  /**
+   * 验证工具调用完整性
+   * 移除没有配对结果的工具调用，防止API错误
+   */
+  private validateToolCallCompleteness(messages: Message[]): Message[] {
+    const result: Message[] = [];
+    const processedToolResults = new Set<string>();
+    const processedToolCalls = new Set<string>();
+
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+
+      if (message.tool_call_id) {
+        if (processedToolResults.has(message.tool_call_id)) {
+          this.logger.warn(`Removing duplicate tool result: ${message.tool_call_id}`);
+          continue;
+        }
+        processedToolResults.add(message.tool_call_id);
+        result.push(message);
+        continue;
+      }
+
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        // Check for duplicate tool calls with same IDs
+        const uniqueToolCalls = message.tool_calls.filter((call) => {
+          if (processedToolCalls.has(call.id)) {
+            this.logger.warn(`Removing duplicate tool call: ${call.id}`);
+            return false;
+          }
+          processedToolCalls.add(call.id);
+          return true;
+        });
+
+        if (uniqueToolCalls.length === 0) {
+          // All tool calls were duplicates, just add content if available
+          if (message.content) {
+            result.push(
+              new Message({
+                role: message.role,
+                content: message.content,
+              })
+            );
+          }
+          continue;
+        }
+
+        const toolCallIds = uniqueToolCalls.map((call) => call.id);
+
+        const hasMatchingResults = toolCallIds.every((id) =>
+          messages.some((msg) => msg.tool_call_id === id)
+        );
+
+        if (hasMatchingResults) {
+          if (uniqueToolCalls.length < message.tool_calls.length) {
+            // Some tool calls were removed, create new message with unique ones
+            result.push(
+              new Message({
+                role: message.role,
+                content: message.content,
+                tool_calls: uniqueToolCalls,
+              })
+            );
+          } else {
+            result.push(message);
+          }
+        } else {
+          this.logger.warn(`Removing incomplete tool call: ${toolCallIds.join(', ')}`);
+          if (message.content) {
+            result.push(
+              new Message({
+                role: message.role,
+                content: message.content,
+              })
+            );
+          }
+        }
+      } else {
+        result.push(message);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * 获取上下文消息
+   * 使用Mem0记忆管理器获取相关上下文，否则返回所有消息
+   */
+  async getContextualMessages(currentQuery?: string): Promise<Message[]> {
+    try {
+      const allMessages = this.memory.messages;
+      let contextualMessages: Message[] = [];
+
+      // 优先使用 Mem0 记忆管理器获取相关上下文
+      if (this.memoryManager?.isEnabled()) {
+        try {
+          const query = currentQuery || this.extractCurrentQuery();
+          contextualMessages = await this.memoryManager.getRelevantContext(query, allMessages);
+          this.logger.debug(
+            `Mem0MemoryManager returned ${contextualMessages.length} contextual messages`
+          );
+        } catch (error) {
+          this.logger.error(`Mem0MemoryManager failed: ${error}`);
+          contextualMessages = [];
+        }
+      }
+
+      // 回退到原始消息
+      if (contextualMessages.length === 0) {
+        this.logger.debug(`Using original messages: ${allMessages.length} messages`);
+        contextualMessages = allMessages;
+      }
+
+      // 确保工具调用完整性
+      let processedMessages = this.ensureToolCallIntegrity(contextualMessages);
+      processedMessages = this.validateToolCallCompleteness(processedMessages);
+
+      this.logger.debug(
+        `Final contextual messages: ${processedMessages.length} (after tool call validation)`
+      );
+      return processedMessages;
+    } catch (error) {
+      this.logger.error(`Failed to get contextual messages: ${error}`);
+      return this.memory.messages;
     }
   }
 
   /**
-   * 获取智能上下文消息
-   * 优先使用ConversationContextManager，回退到Mem0MemoryManager或传统方法
+   * 保存对话到记忆系统
    */
-  async getContextualMessages(currentQuery?: string): Promise<Message[]> {
-    const query = currentQuery || this.extractCurrentQuery();
+  async saveConversationToMemory(
+    messages: Message[],
+    response: { content?: string | null; tool_calls?: any[]; usage?: any }
+  ): Promise<void> {
+    try {
+      const conversationToSave = [...messages];
 
-    // 1. 优先使用智能对话上下文管理器
-    if (this.conversationManager) {
-      try {
-        const contextMessages = await this.conversationManager.getRelevantContext(query);
-        this.logger.info(
-          `Using ConversationContextManager: ${contextMessages.length} contextual messages`
+      // 添加助手的回复到对话记录
+      if (response.content || response.tool_calls) {
+        conversationToSave.push(
+          new Message({
+            role: Role.ASSISTANT,
+            content: response.content || null,
+            tool_calls: response.tool_calls,
+          })
         );
-        return contextMessages;
-      } catch (error) {
-        this.logger.error(`ConversationContextManager failed, falling back: ${error}`);
       }
-    }
 
-    // 2. 回退到Mem0记忆管理器
-    if (this.isMemoryEnabled() && this.memoryManager) {
-      try {
-        const contextMessages = await this.memoryManager.getRelevantContext(query, this.messages);
-        this.logger.info(`Using Mem0MemoryManager: ${contextMessages.length} contextual messages`);
-        return contextMessages;
-      } catch (error) {
-        this.logger.error(`Mem0MemoryManager failed, using traditional messages: ${error}`);
+      const metadata = {
+        timestamp: new Date().toISOString(),
+        agent: this.name,
+        usage: response.usage,
+      };
+
+      // 保存到 Mem0 记忆管理器
+      if (this.memoryManager?.isEnabled()) {
+        await this.memoryManager.addConversation(conversationToSave, metadata);
       }
-    }
 
-    // 3. 传统方法：返回所有消息
-    this.logger.info(`Using traditional messages: ${this.messages.length} total messages`);
-    return this.messages;
+      this.logger.debug(`Saved ${conversationToSave.length} messages to memory systems`);
+    } catch (error) {
+      this.logger.error(`Failed to save conversation to memory: ${error}`);
+    }
   }
 
   /**
@@ -245,53 +325,47 @@ export abstract class BaseAgent {
    */
   protected extractCurrentQuery(): string {
     const lastUserMessage = this.messages.filter((msg) => msg.role === Role.USER).pop();
-
     return lastUserMessage?.content || '';
   }
 
   /**
    * 执行代理的主循环
-   * @param request 可选的初始用户请求
-   * @returns 执行结果的摘要
    */
   async run(request?: string): Promise<string> {
-    if (this.state !== AgentState.IDLE) {
-      throw new Error(`无法从状态 ${this.state} 运行代理`);
-    }
+    this.state = AgentState.RUNNING;
+    this.currentStep = 0;
 
     if (request) {
       this.updateMemory(Role.USER, request);
     }
 
-    const results: string[] = [];
-    await this.withState(AgentState.RUNNING, async () => {
-      while (this.currentStep < this.maxSteps && this.state !== AgentState.FINISHED) {
-        this.currentStep += 1;
-        this.logger.info(`执行步骤 ${this.currentStep}/${this.maxSteps}`);
+    this.logger.info(`🚀 ${this.name} 开始执行任务${request ? `: ${request}` : ''}`);
+
+    try {
+      while (this.state === AgentState.RUNNING && this.currentStep < this.maxSteps) {
+        this.currentStep++;
+        this.logger.info(`⚡ ${this.name} 执行第 ${this.currentStep} 步`);
+
         const stepResult = await this.step();
 
-        // 检查是否陷入循环
         if (this.isStuck()) {
           this.handleStuckState();
+          break;
         }
-
-        results.push(`步骤 ${this.currentStep}: ${stepResult}`);
       }
 
-      if (this.currentStep >= this.maxSteps) {
-        this.currentStep = 0;
-        this.state = AgentState.IDLE;
-        results.push(`终止: 达到最大步骤数 (${this.maxSteps})`);
-      }
-    });
-
-    await this.cleanup();
-    return results.join('\n') || '没有执行任何步骤';
+      this.state = AgentState.FINISHED;
+      const finalMessage = this.messages[this.messages.length - 1];
+      return finalMessage?.content || '任务执行完成';
+    } catch (error) {
+      this.state = AgentState.ERROR;
+      this.logger.error(`💥 ${this.name} 执行出错: ${error}`);
+      throw error;
+    }
   }
 
   /**
-   * 执行单个步骤
-   * 子类必须实现此方法以定义特定行为
+   * 执行一个步骤 - 由子类实现
    */
   abstract step(): Promise<string>;
 
@@ -299,53 +373,51 @@ export abstract class BaseAgent {
    * 处理陷入循环的状态
    */
   protected handleStuckState(): void {
-    const stuckPrompt = '检测到重复响应。考虑新策略，避免重复已尝试的无效路径。';
-    this.nextStepPrompt = `${stuckPrompt}\n${this.nextStepPrompt}`;
-    this.logger.warn(`代理检测到陷入循环。添加提示: ${stuckPrompt}`);
+    this.logger.warn(`⚠️ ${this.name} 可能陷入循环，停止执行`);
+    this.state = AgentState.FINISHED;
   }
 
   /**
-   * 检查代理是否陷入循环
+   * 检查是否陷入循环
    */
   protected isStuck(): boolean {
-    if (this.memory.messages.length < 2) {
+    if (this.messages.length < this.duplicateThreshold * 2) {
       return false;
     }
 
-    const lastMessage = this.memory.messages[this.memory.messages.length - 1];
-    if (!lastMessage.content) {
-      return false;
-    }
+    const recentMessages = this.messages.slice(-this.duplicateThreshold * 2);
+    const firstHalf = recentMessages.slice(0, this.duplicateThreshold);
+    const secondHalf = recentMessages.slice(this.duplicateThreshold);
 
-    // 计算相同内容出现的次数
-    let duplicateCount = 0;
-    for (let i = this.memory.messages.length - 2; i >= 0; i--) {
-      const msg = this.memory.messages[i];
-      if (msg.role === Role.ASSISTANT && msg.content === lastMessage.content) {
-        duplicateCount += 1;
+    for (let i = 0; i < this.duplicateThreshold; i++) {
+      if (
+        firstHalf[i].role !== secondHalf[i].role ||
+        firstHalf[i].content !== secondHalf[i].content
+      ) {
+        return false;
       }
     }
 
-    return duplicateCount >= this.duplicateThreshold;
+    return true;
   }
 
   /**
    * 清理资源
    */
   async cleanup(): Promise<void> {
-    // 基类中的默认实现为空
-    // 子类可以覆盖此方法以实现特定的清理逻辑
+    this.logger.info(`🧹 ${this.name} 清理资源中...`);
+    this.state = AgentState.IDLE;
   }
 
   /**
-   * 获取代理的消息列表
+   * 获取消息列表
    */
   get messages(): Message[] {
     return this.memory.messages;
   }
 
   /**
-   * 设置代理的消息列表
+   * 设置消息列表
    */
   set messages(value: Message[]) {
     this.memory.messages = value;

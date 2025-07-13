@@ -199,11 +199,18 @@ export class ToolRouter extends EventEmitter {
    * MCP优先策略
    */
   private async mcpFirstStrategy(request: ToolCallRequest): Promise<any> {
+    this.logger.debug(`使用MCP优先策略路由工具: ${request.name}`);
+
     // 首先尝试在MCP服务中找到工具
     const mcpTools = this.mcpManager.getAllAvailableTools();
+    this.logger.debug(
+      `可用的MCP工具: ${mcpTools.map((t) => `${t.serviceName}:${t.tool.name}`).join(', ')}`
+    );
+
     const mcpTool = mcpTools.find((t) => t.tool.name === request.name);
 
     if (mcpTool) {
+      this.logger.debug(`在MCP服务 ${mcpTool.serviceName} 中找到工具: ${request.name}`);
       return {
         type: 'mcp',
         target: mcpTool.serviceName,
@@ -212,6 +219,8 @@ export class ToolRouter extends EventEmitter {
       };
     }
 
+    this.logger.debug(`MCP服务中未找到工具 ${request.name}，尝试A2A代理`);
+
     // 如果MCP中没有，尝试A2A代理
     const a2aAgents = await this.agentManager.getAvailableAgents();
     const suitableAgent = a2aAgents.find((agent) =>
@@ -219,6 +228,7 @@ export class ToolRouter extends EventEmitter {
     );
 
     if (suitableAgent) {
+      this.logger.debug(`在A2A代理 ${suitableAgent.config.name} 中找到匹配能力`);
       return {
         type: 'a2a',
         target: suitableAgent.config.name,
@@ -227,6 +237,9 @@ export class ToolRouter extends EventEmitter {
       };
     }
 
+    this.logger.error(
+      `无法找到执行工具 ${request.name} 的服务。可用MCP工具: ${mcpTools.map((t) => t.tool.name).join(', ')}`
+    );
     throw new Error(`无法找到执行工具 ${request.name} 的服务`);
   }
 
@@ -343,6 +356,7 @@ export class ToolRouter extends EventEmitter {
     serviceName: string
   ): Promise<ToolCallResult> {
     try {
+      this.logger.debug(`执行MCP工具: ${request.name} 在服务 ${serviceName}`);
       const result = await this.mcpManager.callTool(serviceName, request.name, request.arguments);
 
       return {
@@ -356,6 +370,7 @@ export class ToolRouter extends EventEmitter {
         },
       };
     } catch (error) {
+      this.logger.error(`MCP工具执行失败: ${request.name} 在服务 ${serviceName}`, error);
       throw new Error(`MCP工具执行失败: ${error}`);
     }
   }
@@ -475,13 +490,21 @@ export class ToolRouter extends EventEmitter {
     // 预定义一些常见工具的能力映射
     const predefinedMappings = {
       FileOperatorsTool: ['file_operations'],
+      file_operators: ['file_operations'],
       BashTool: ['command_execution'],
+      bash: ['command_execution'],
       PlanningTool: ['planning'],
+      planning: ['planning'],
       StrReplaceEditorTool: ['file_operations', 'text_processing'],
+      str_replace_editor: ['file_operations', 'text_processing'],
       CreateChatCompletionTool: ['language_processing'],
+      create_chat_completion: ['language_processing'],
       AskHumanTool: ['human_interaction'],
+      ask_human: ['human_interaction'],
       SystemInfoTool: ['system_monitoring'],
+      system_info: ['system_monitoring'],
       Terminate: ['process_control'],
+      terminate: ['process_control'],
     };
 
     for (const [toolName, capabilities] of Object.entries(predefinedMappings)) {

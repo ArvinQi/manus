@@ -36,16 +36,8 @@ export abstract class ReActAgent extends BaseAgent {
       userId: options.userId,
     });
 
-    // 获取记忆配置（优先使用传入的配置，否则从配置文件读取）
-    const finalMemoryConfig = options.memoryConfig || config.getMemoryConfig();
-
-    // 初始化LLM，如果有记忆管理器则传递给LLM
-    this.llm = new LLM(options.llmConfigName || 'default', finalMemoryConfig, options.userId);
-
-    // 如果LLM没有记忆管理器但Agent有，则设置给LLM
-    if (this.memoryManager && !this.llm.getMemoryManager()) {
-      this.llm.setMemoryManager(this.memoryManager);
-    }
+    // 初始化简化的LLM，不传递记忆管理相关参数
+    this.llm = new LLM(options.llmConfigName || 'default');
   }
 
   /**

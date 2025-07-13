@@ -119,7 +119,14 @@ export class MultiMcpManager extends EventEmitter {
         name: 'system_tools',
         type: 'stdio', // 使用stdio类型作为占位符
         enabled: true,
-        capabilities: ['bash', 'file_operations', 'planning', 'chat_completion', 'system_info'],
+        capabilities: [
+          'bash',
+          'file_operations',
+          'planning',
+          'chat_completion',
+          'system_info',
+          'process_control',
+        ],
         priority: 1,
         timeout: 30000,
         retry_count: 3,

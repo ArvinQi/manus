@@ -1,17 +1,14 @@
 /**
  * LLM 接口类
  * 负责与语言模型进行交互
+ * 专注于纯粹的语言模型请求，不处理消息优化
  */
 
 import OpenAI from 'openai';
+import { promises as fs } from 'fs';
 import { Message, ToolChoice, Role } from '../schema/index.js';
 import { config } from '../utils/config.js';
 import { Logger } from '../utils/logger.js';
-import { Mem0MemoryManager, MemoryConfig } from '../core/mem0_memory_manager.js';
-import {
-  ConversationContextManager,
-  ConversationConfig,
-} from '../core/conversation_context_manager.js';
 
 // LLM 响应接口
 interface LLMResponse {
@@ -38,25 +35,37 @@ const TASK_TO_MODEL_CONFIG: Record<TaskType, string> = {
   [TaskType.ANALYSIS]: 'default',
 };
 
+// 重试配置
+interface RetryConfig {
+  enabled: boolean;
+  maxRetries: number;
+  initialDelayMs: number;
+  maxDelayMs: number;
+  backoffMultiplier: number;
+}
+
+const DEFAULT_RETRY_CONFIG: RetryConfig = {
+  enabled: true,
+  maxRetries: 3,
+  initialDelayMs: 6000,
+  maxDelayMs: 60000,
+  backoffMultiplier: 2,
+};
+
 /**
  * LLM 类
- * 处理与语言模型的交互，支持智能记忆管理
+ * 处理与语言模型的交互，专注于纯粹的模型请求
  */
 export class LLM {
   private client: OpenAI;
   private logger: Logger;
   private configName: string;
-  private memoryManager?: Mem0MemoryManager;
-  private conversationManager?: ConversationContextManager;
+  private retryConfig: RetryConfig;
 
-  constructor(
-    configName: string = 'default',
-    memoryConfig?: MemoryConfig,
-    userId?: string,
-    conversationConfig?: ConversationConfig
-  ) {
+  constructor(configName: string = 'default', retryConfig?: Partial<RetryConfig>) {
     this.configName = configName;
     this.logger = new Logger('LLM');
+    this.retryConfig = { ...DEFAULT_RETRY_CONFIG, ...retryConfig };
 
     // 获取 LLM 配置
     const llmConfig = config.getLLMConfig(configName);
@@ -66,120 +75,14 @@ export class LLM {
       apiKey: llmConfig.api_key,
       baseURL: llmConfig.base_url,
     });
-
-    // 获取记忆配置（优先使用传入的配置，否则从配置文件读取）
-    const finalMemoryConfig = memoryConfig || config.getMemoryConfig();
-
-    // 初始化记忆管理器（如果配置启用）
-    if (finalMemoryConfig.enabled) {
-      try {
-        // 将当前模型配置名称传递给记忆管理器
-        const memoryConfigWithTask = {
-          ...finalMemoryConfig,
-          taskType: configName,
-        };
-        this.memoryManager = new Mem0MemoryManager(memoryConfigWithTask, userId);
-        this.logger.info(`LLM initialized with memory management for task type: ${configName}`);
-      } catch (error) {
-        this.logger.error(`Failed to initialize memory manager: ${error}`);
-      }
-    }
-
-    // 获取对话配置（优先使用传入的配置，否则从配置文件读取）
-    const finalConversationConfig = conversationConfig || config.getConversationConfig();
-
-    // 初始化对话上下文管理器（默认启用）
-    try {
-      // 如果没有记忆管理器，创建一个默认的记忆管理器
-      const memMgr =
-        this.memoryManager ||
-        (finalMemoryConfig.enabled
-          ? new Mem0MemoryManager({ ...finalMemoryConfig, taskType: configName }, userId)
-          : undefined);
-      this.conversationManager = new ConversationContextManager(
-        finalConversationConfig,
-        memMgr as any
-      );
-      this.logger.info(
-        `LLM initialized with intelligent conversation context management for task type: ${configName}`
-      );
-    } catch (error) {
-      this.logger.error(`Failed to initialize conversation manager: ${error}`);
-    }
   }
 
   /**
-   * 获取记忆管理器
+   * 根据任务类型创建 LLM 实例
    */
-  getMemoryManager(): Mem0MemoryManager | undefined {
-    return this.memoryManager;
-  }
-
-  /**
-   * 设置记忆管理器
-   */
-  setMemoryManager(memoryManager: Mem0MemoryManager): void {
-    this.memoryManager = memoryManager;
-    this.logger.info('Memory manager updated');
-  }
-
-  /**
-   * 获取对话上下文管理器
-   */
-  getConversationManager(): ConversationContextManager | undefined {
-    return this.conversationManager;
-  }
-
-  /**
-   * 设置对话上下文管理器
-   */
-  setConversationManager(conversationManager: ConversationContextManager): void {
-    this.conversationManager = conversationManager;
-    this.logger.info('Conversation context manager updated');
-  }
-
-  /**
-   * 创建默认的对话上下文配置
-   */
-  static createDefaultConversationConfig(): ConversationConfig {
-    return {
-      maxContextMessages: 10,
-      maxTokenLimit: 4000,
-      relevanceThreshold: 0.5,
-      importanceThreshold: 0.6,
-      sessionTimeoutMs: 30 * 60 * 1000, // 30分钟
-      summarizationThreshold: 20,
-    };
-  }
-
-  /**
-   * 根据任务类型创建优化的 LLM 实例
-   * @param taskType 任务类型
-   * @param memoryConfig 记忆配置
-   * @param userId 用户ID
-   * @param conversationConfig 对话配置
-   * @returns 优化的 LLM 实例
-   */
-  static createForTask(
-    taskType: TaskType,
-    memoryConfig?: MemoryConfig,
-    userId?: string,
-    conversationConfig?: ConversationConfig
-  ): LLM {
+  static createForTask(taskType: TaskType, retryConfig?: Partial<RetryConfig>): LLM {
     const configName = TASK_TO_MODEL_CONFIG[taskType];
-    const llm = new LLM(configName, memoryConfig, userId, conversationConfig);
-
-    // 记录任务类型信息
-    llm.logger.info(`LLM created for task type: ${taskType} using config: ${configName}`);
-
-    return llm;
-  }
-
-  /**
-   * 获取当前使用的模型配置名称
-   */
-  getConfigName(): string {
-    return this.configName;
+    return new LLM(configName, retryConfig);
   }
 
   /**
@@ -195,108 +98,50 @@ export class LLM {
   }
 
   /**
-   * 智能处理消息上下文
-   * 优先使用ConversationContextManager，回退到Mem0MemoryManager或原始消息
+   * 确保消息有效性（至少一条非系统消息）
    */
-  private async getContextualMessages(options: {
-    messages: Message[];
-    systemMsgs?: Message[];
-    currentQuery?: string;
-  }): Promise<Message[]> {
-    const { messages, systemMsgs = [], currentQuery } = options;
+  private ensureValidMessages(messages: Message[]): Message[] {
+    const hasNonSystemMessage = messages.some((msg) => msg.role !== Role.SYSTEM);
 
-    // 1. 优先使用智能对话上下文管理器
-    if (this.conversationManager) {
-      try {
-        const query = currentQuery || this.extractCurrentQuery(messages);
-        const relevantMessages = await this.conversationManager.getRelevantContext(query);
-
-        // 合并系统消息和相关上下文
-        const result = [...systemMsgs, ...relevantMessages];
-
-        this.logger.info(`Using ConversationContextManager: ${result.length} contextual messages`);
-        return result;
-      } catch (error) {
-        this.logger.error(`ConversationContextManager failed, falling back: ${error}`);
-      }
+    if (hasNonSystemMessage) {
+      return messages;
     }
 
-    // 2. 回退到Mem0记忆管理器
-    if (this.memoryManager && this.memoryManager.isEnabled()) {
-      try {
-        const query = currentQuery || this.extractCurrentQuery(messages);
-        const contextualMessages = await this.memoryManager.getRelevantContext(query, messages);
+    // 创建默认消息
+    const defaultMessage = new Message({
+      role: Role.USER,
+      content: '请继续对话',
+    });
 
-        // 合并系统消息和上下文消息
-        const result = [...systemMsgs, ...contextualMessages];
-
-        this.logger.info(`Using Mem0MemoryManager: ${result.length} contextual messages`);
-        return result;
-      } catch (error) {
-        this.logger.error(`Mem0MemoryManager failed, using original messages: ${error}`);
-      }
-    }
-
-    // 3. 最终回退：返回原始消息
-    this.logger.info(
-      `Using original messages: ${systemMsgs.length + messages.length} total messages`
-    );
-    return [...systemMsgs, ...messages];
+    this.logger.warn('No non-system messages found, adding default user message');
+    return [...messages, defaultMessage];
   }
 
   /**
-   * 从消息中提取当前查询
+   * 延迟函数
    */
-  private extractCurrentQuery(messages: Message[]): string {
-    // 获取最后一条用户消息作为查询
-    const lastUserMessage = messages.filter((msg) => msg.role === 'user').pop();
-
-    return lastUserMessage?.content || '';
+  private async delay(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   /**
-   * 保存对话到记忆系统中
+   * 检查是否为可重试的错误
    */
-  private async saveConversationToMemory(
-    messages: Message[],
-    response: LLMResponse
-  ): Promise<void> {
-    try {
-      // 准备要保存的对话
-      const conversationToSave = [...messages];
+  private isRetryableError(error: any): boolean {
+    if (!error.status) return false;
 
-      // 添加AI响应
-      if (response.content || response.tool_calls) {
-        const assistantMessage = new Message({
-          role: Role.ASSISTANT,
-          content: response.content,
-          tool_calls: response.tool_calls,
-        });
-        conversationToSave.push(assistantMessage);
-      }
+    // 429 (Rate Limit), 500, 502, 503, 504 是可重试的错误
+    const retryableStatuses = [429, 500, 502, 503, 504];
+    return retryableStatuses.includes(error.status);
+  }
 
-      const metadata = {
-        timestamp: new Date().toISOString(),
-        model: config.getLLMConfig(this.configName).model,
-        usage: response.usage,
-      };
-
-      // 1. 保存到对话上下文管理器（如果启用）
-      if (this.conversationManager) {
-        for (const message of conversationToSave) {
-          await this.conversationManager.addMessage(message, metadata);
-        }
-        this.logger.debug('Conversation saved to ConversationContextManager');
-      }
-
-      // 2. 保存到Mem0记忆管理器（如果启用）
-      if (this.memoryManager && this.memoryManager.isEnabled()) {
-        await this.memoryManager.addConversation(conversationToSave, metadata);
-        this.logger.debug('Conversation saved to Mem0MemoryManager');
-      }
-    } catch (error) {
-      this.logger.error(`Failed to save conversation to memory: ${error}`);
-    }
+  /**
+   * 计算重试延迟时间
+   */
+  private calculateRetryDelay(attempt: number): number {
+    const delay =
+      this.retryConfig.initialDelayMs * Math.pow(this.retryConfig.backoffMultiplier, attempt);
+    return Math.min(delay, this.retryConfig.maxDelayMs);
   }
 
   /**
@@ -309,125 +154,194 @@ export class LLM {
     toolChoice?: ToolChoice;
     currentQuery?: string;
   }): Promise<LLMResponse> {
-    try {
-      const llmConfig = config.getLLMConfig(this.configName);
+    const startTime = Date.now();
+    let lastError: any;
 
-      // 获取上下文消息（智能记忆管理）
-      const contextualMessages = await this.getContextualMessages({
-        messages: options.messages,
-        systemMsgs: options.systemMsgs,
-        currentQuery: options.currentQuery,
-      });
+    for (let attempt = 0; attempt <= this.retryConfig.maxRetries; attempt++) {
+      try {
+        // 如果不是第一次尝试，需要等待
+        if (attempt > 0 && this.retryConfig.enabled) {
+          const delayMs = this.calculateRetryDelay(attempt - 1);
+          this.logger.warn(
+            `Rate limit hit, retrying in ${delayMs}ms (attempt ${attempt + 1}/${this.retryConfig.maxRetries + 1})`
+          );
+          await this.delay(delayMs);
+        }
 
-      // 记录消息处理情况
-      const originalMessageCount = (options.systemMsgs?.length || 0) + options.messages.length;
-      const contextualMessageCount = contextualMessages.length;
+        const llmConfig = config.getLLMConfig(this.configName);
 
-      if (this.memoryManager?.isEnabled()) {
-        this.logger.info(
-          `Message optimization: ${originalMessageCount} → ${contextualMessageCount} messages`
-        );
-      }
+        // 合并系统消息和用户消息
+        const allMessages = [...(options.systemMsgs || []), ...options.messages];
 
-      // 准备消息
-      const allMessages = contextualMessages.map((msg) => {
-        const result: any = {
-          role: msg.role,
+        // 确保消息有效性
+        const validatedMessages = this.ensureValidMessages(allMessages);
+
+        // 准备消息格式
+        const formattedMessages = validatedMessages.map((msg: Message) => ({
+          role: msg.role as any, // 类型转换以匹配 OpenAI API
           content: msg.content,
+          ...(msg.tool_calls && { tool_calls: msg.tool_calls }),
+          ...(msg.tool_call_id && { tool_call_id: msg.tool_call_id }),
+          ...(msg.name && { name: msg.name }),
+        }));
+
+        // 发送请求
+        const response = await this.client.chat.completions.create({
+          model: llmConfig.model,
+          messages: formattedMessages as any, // 类型转换以匹配 OpenAI API
+          tools: options.tools,
+          tool_choice: options.toolChoice,
+          temperature: llmConfig.temperature,
+          max_tokens: llmConfig.max_tokens,
+        });
+
+        const llmResponse: LLMResponse = {
+          content: response.choices[0].message.content,
+          tool_calls: response.choices[0].message.tool_calls,
+          usage: response.usage,
         };
 
-        // 添加工具调用信息
-        if (msg.tool_calls) {
-          result.tool_calls = msg.tool_calls;
+        const executionTime = Date.now() - startTime;
+
+        // 记录详细任务日志
+        await this.logTaskDetails(options, llmResponse, undefined, executionTime);
+
+        // 记录简单使用日志
+        await this.logUsage(llmResponse, formattedMessages.length);
+
+        return llmResponse;
+      } catch (error: any) {
+        lastError = error;
+
+        // 如果是可重试的错误且还有重试次数
+        if (
+          this.retryConfig.enabled &&
+          this.isRetryableError(error) &&
+          attempt < this.retryConfig.maxRetries
+        ) {
+          this.logger.warn(
+            `Request failed with retryable error (attempt ${attempt + 1}), will retry: ${error.message || error}`
+          );
+          continue;
         }
 
-        // 添加工具调用 ID
-        if (msg.tool_call_id) {
-          result.tool_call_id = msg.tool_call_id;
-        }
+        // 如果不可重试或已达到最大重试次数，记录错误并抛出
+        const executionTime = Date.now() - startTime;
+        await this.logTaskDetails(options, undefined, error, executionTime);
 
-        // 添加名称
-        if (msg.name) {
-          result.name = msg.name;
-        }
+        this.logger.error(
+          `LLM request failed after ${attempt + 1} attempts: ${error.message || error}`
+        );
+        throw error;
+      }
+    }
 
-        return result;
-      });
+    // 理论上不应该到达这里，但为了类型安全
+    throw lastError || new Error('Unknown error occurred');
+  }
 
-      // 发送请求
-      const response = await this.client.chat.completions.create({
-        model: llmConfig.model,
-        messages: allMessages,
-        tools: options.tools,
-        tool_choice: options.toolChoice,
-        temperature: llmConfig.temperature,
-        max_tokens: llmConfig.max_tokens,
-      });
+  /**
+   * 记录详细的任务日志到 task_log.jsonl
+   */
+  private async logTaskDetails(
+    input: {
+      messages: Message[];
+      systemMsgs?: Message[];
+      tools?: any[];
+      toolChoice?: ToolChoice;
+      currentQuery?: string;
+    },
+    response?: LLMResponse,
+    error?: any,
+    executionTime?: number
+  ): Promise<void> {
+    try {
+      const logDir = './.manus';
+      const logFile = `${logDir}/task_log.jsonl`;
 
-      // 处理响应
-      const choice = response.choices[0];
-      const llmResponse: LLMResponse = {
-        content: choice.message.content,
-        tool_calls: choice.message.tool_calls,
-        usage: response.usage,
-      };
-
-      // 保存对话到记忆中
-      await this.saveConversationToMemory(options.messages, llmResponse);
-
-      // 记录任务执行日志到 .manus 目录，采用 JSON 行格式
+      // 确保目录存在
       try {
-        const fs = await import('fs');
-        const logPath = './.manus/task_log.jsonl';
-        const logObj = {
-          timestamp: new Date().toISOString(),
-          model: llmConfig.model,
-          messages: allMessages,
-          response: {
-            content: choice.message.content,
-            tool_calls: choice.message.tool_calls,
+        await fs.mkdir(logDir, { recursive: true });
+      } catch (mkdirError) {
+        // 目录可能已存在，忽略错误
+      }
+
+      const logEntry = {
+        timestamp: new Date().toISOString(),
+        type: 'llm_call',
+        model: this.getModelInfo(),
+        input: {
+          systemMessages:
+            input.systemMsgs?.map((msg) => ({
+              role: msg.role,
+              content: msg.content,
+              ...(msg.tool_calls && { tool_calls: msg.tool_calls }),
+              ...(msg.tool_call_id && { tool_call_id: msg.tool_call_id }),
+              ...(msg.name && { name: msg.name }),
+            })) || [],
+          messages: input.messages.map((msg) => ({
+            role: msg.role,
+            content: msg.content,
+            ...(msg.tool_calls && { tool_calls: msg.tool_calls }),
+            ...(msg.tool_call_id && { tool_call_id: msg.tool_call_id }),
+            ...(msg.name && { name: msg.name }),
+          })),
+          tools: input.tools || [],
+          toolChoice: input.toolChoice,
+          currentQuery: input.currentQuery,
+          totalInputMessages: (input.systemMsgs?.length || 0) + input.messages.length,
+        },
+        ...(response && {
+          output: {
+            content: response.content,
+            tool_calls: response.tool_calls || [],
             usage: response.usage,
           },
-          memoryEnabled: this.memoryManager?.isEnabled() || false,
-          messageOptimization: {
-            original: originalMessageCount,
-            contextual: contextualMessageCount,
-            savedMessages: Math.max(0, originalMessageCount - contextualMessageCount),
+        }),
+        ...(error && {
+          error: {
+            message: error.message || String(error),
+            status: error.status,
+            type: error.constructor.name,
           },
-        };
-        fs.promises.appendFile(logPath, JSON.stringify(logObj) + '\n', 'utf-8');
-      } catch (e) {
-        this.logger.error(`记录任务执行日志失败: ${e}`);
-      }
+        }),
+        executionTime: executionTime,
+        success: !error,
+      };
 
-      // 记录 token 消耗到 .manus 目录，采用 JSON 行格式
-      if (response.usage) {
+      await fs.appendFile(logFile, JSON.stringify(logEntry) + '\n', 'utf-8');
+    } catch (logError) {
+      this.logger.error(`记录任务日志失败: ${logError}`);
+    }
+  }
+
+  /**
+   * 记录使用情况
+   */
+  private async logUsage(response: LLMResponse, messageCount: number): Promise<void> {
+    if (response.usage) {
+      try {
+        const logDir = './.manus';
+        const logFile = `${logDir}/token_usage.jsonl`;
+
+        // 确保目录存在
         try {
-          const fs = await import('fs');
-          const path = './.manus/token_usage.jsonl';
-          const logObj = {
-            timestamp: new Date().toISOString(),
-            model: llmConfig.model,
-            prompt_tokens: response.usage.prompt_tokens,
-            completion_tokens: response.usage.completion_tokens,
-            total_tokens: response.usage.total_tokens,
-            memoryEnabled: this.memoryManager?.isEnabled() || false,
-            messageOptimization: {
-              original: originalMessageCount,
-              contextual: contextualMessageCount,
-              savedMessages: Math.max(0, originalMessageCount - contextualMessageCount),
-            },
-          };
-          fs.promises.appendFile(path, JSON.stringify(logObj) + '\n', 'utf-8');
-        } catch (e) {
-          this.logger.error(`记录 token 消耗失败: ${e}`);
+          await fs.mkdir(logDir, { recursive: true });
+        } catch (mkdirError) {
+          // 目录可能已存在，忽略错误
         }
-      }
 
-      return llmResponse;
-    } catch (error) {
-      this.logger.error(`LLM 请求失败: ${error}`);
-      throw error;
+        const logObj = {
+          timestamp: new Date().toISOString(),
+          model: config.getLLMConfig(this.configName).model,
+          messageCount,
+          ...response.usage,
+        };
+
+        await fs.appendFile(logFile, JSON.stringify(logObj) + '\n', 'utf-8');
+      } catch (error) {
+        this.logger.error(`记录使用情况失败: ${error}`);
+      }
     }
   }
 
@@ -439,12 +353,7 @@ export class LLM {
     systemMsgs?: Message[];
     currentQuery?: string;
   }): Promise<string> {
-    const response = await this.sendRequest({
-      messages: options.messages,
-      systemMsgs: options.systemMsgs,
-      currentQuery: options.currentQuery,
-    });
-
+    const response = await this.sendRequest(options);
     return response.content || '';
   }
 
@@ -458,12 +367,6 @@ export class LLM {
     toolChoice?: ToolChoice;
     currentQuery?: string;
   }): Promise<LLMResponse> {
-    return await this.sendRequest({
-      messages: options.messages,
-      systemMsgs: options.systemMsgs,
-      tools: options.tools,
-      toolChoice: options.toolChoice,
-      currentQuery: options.currentQuery,
-    });
+    return await this.sendRequest(options);
   }
 }

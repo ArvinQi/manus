@@ -64,12 +64,8 @@ export class LLMFactory {
   }
 
   /**
-   * 根据任务类型获取 LLM 实例
-   * @param taskType 任务类型
-   * @param memoryConfig 记忆配置
-   * @param userId 用户ID
-   * @param conversationConfig 对话配置
-   * @returns LLM 实例
+   * 获取指定任务类型的 LLM 实例
+   * 支持缓存和复用
    */
   getLLM(
     taskType: TaskType,
@@ -78,20 +74,18 @@ export class LLMFactory {
     conversationConfig?: ConversationConfig
   ): LLM {
     const cacheKey = this.getCacheKey(taskType, userId);
-
-    // 检查缓存
     const cached = this.cache.get(cacheKey);
+
+    // 检查缓存是否有效
     if (cached && this.isCacheValid(cached)) {
-      // 更新使用统计
       cached.lastUsed = Date.now();
       cached.useCount++;
-
-      this.logger.debug(`Retrieved cached LLM for task: ${taskType}, user: ${userId || 'default'}`);
+      this.logger.debug(`Cache hit for ${taskType}, user: ${userId || 'default'}`);
       return cached.llm;
     }
 
-    // 创建新的 LLM 实例
-    const llm = LLM.createForTask(taskType, memoryConfig, userId, conversationConfig);
+    // 创建新的 LLM 实例（简化参数，记忆管理由Agent负责）
+    const llm = LLM.createForTask(taskType);
 
     // 缓存实例
     this.cacheInstance(cacheKey, llm, taskType);
@@ -101,22 +95,29 @@ export class LLMFactory {
   }
 
   /**
-   * 预加载常用模型
+   * 预加载常用模型以提高响应速度
    */
   private async preloadCommonModels(): Promise<void> {
-    try {
-      // 预加载 DEFAULT 和 CODING 模型
-      const commonTasks = [TaskType.DEFAULT, TaskType.CODING];
-
-      for (const taskType of commonTasks) {
-        const llm = LLM.createForTask(taskType);
-        this.cacheInstance(this.getCacheKey(taskType, 'default'), llm, taskType);
-      }
-
-      this.logger.info('Preloaded common LLM models');
-    } catch (error) {
-      this.logger.error(`Failed to preload models: ${error}`);
+    if (!this.config.enablePreload) {
+      return;
     }
+
+    const commonTasks: TaskType[] = [TaskType.DEFAULT, TaskType.CODING, TaskType.PLANNING];
+
+    this.logger.info('Preloading common LLM models...');
+
+    for (const taskType of commonTasks) {
+      try {
+        const llm = LLM.createForTask(taskType);
+        const cacheKey = this.getCacheKey(taskType);
+        this.cacheInstance(cacheKey, llm, taskType);
+        this.logger.debug(`Preloaded LLM for task: ${taskType}`);
+      } catch (error) {
+        this.logger.error(`Failed to preload LLM for task ${taskType}: ${error}`);
+      }
+    }
+
+    this.logger.info(`Preloaded ${commonTasks.length} LLM models`);
   }
 
   /**
@@ -131,7 +132,7 @@ export class LLMFactory {
    */
   private isCacheValid(cached: LLMCacheItem): boolean {
     const now = Date.now();
-    return (now - cached.createdAt) < this.config.cacheExpiryMs!;
+    return now - cached.createdAt < this.config.cacheExpiryMs!;
   }
 
   /**
@@ -182,7 +183,7 @@ export class LLMFactory {
     const keysToDelete: string[] = [];
 
     for (const [key, item] of this.cache.entries()) {
-      if ((now - item.createdAt) > this.config.cacheExpiryMs!) {
+      if (now - item.createdAt > this.config.cacheExpiryMs!) {
         keysToDelete.push(key);
       }
     }

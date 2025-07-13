@@ -58,7 +58,7 @@ export class Mem0MemoryManager {
         this.ensureDirectoryExists(vectorDbPath);
 
         // 根据任务类型选择合适的 LLM 配置
-        const taskType = config.taskType || 'default';
+        const taskType = config.taskType || 'mem0';
         const llmConfig = manusConfig.getLLMConfig(taskType);
         const embeddingConfig = manusConfig.getLLMConfig('embedding');
 
@@ -67,22 +67,38 @@ export class Mem0MemoryManager {
           historyDbPath: dbPath,
           vectorDbPath: vectorDbPath,
           llm: {
-            provider: 'anthropic',
+            provider: 'openai',
             config: {
               model: llmConfig.model,
-              api_key: llmConfig.api_key,
-              base_url: llmConfig.base_url,
+              apiKey: llmConfig.api_key,
+              baseURL: llmConfig.base_url,
               temperature: llmConfig.temperature || 0.2,
-              max_tokens: Math.min(llmConfig.max_tokens || 1500, 1500),
+              maxTokens: Math.min(llmConfig.max_tokens || 1500, 1500),
+              modelProperties: {
+                endpoint: llmConfig.base_url,
+                apiVersion: '2024-02-01',
+              },
             },
           },
           embedder: {
-            provider: 'openai',
+            // provider: 'openai',
+            // config: {
+            //   model: embeddingConfig.model,
+            //   embedding_dims: 1536,
+            //   apiKey: embeddingConfig.api_key,
+            //   baseURL: embeddingConfig.base_url,
+            // },
+            provider: 'azure_openai',
             config: {
+              apiKey: embeddingConfig.api_key || '',
+              baseUrl: embeddingConfig.base_url,
               model: embeddingConfig.model,
-              embedding_dims: 1536,
-              api_key: embeddingConfig.api_key,
-              base_url: embeddingConfig.base_url,
+              modelProperties: {
+                endpoint: embeddingConfig.base_url,
+                // deployment: '455-text-embedding-ada-002',
+                // modelName: embeddingConfig.model,
+                apiVersion: '2024-02-01',
+              },
             },
           },
           vectorStore: {
@@ -98,11 +114,18 @@ export class Mem0MemoryManager {
         this.logger.info(`Mem0 Memory Manager initialized successfully`);
         this.logger.info(`  - Task Type: ${taskType}`);
         this.logger.info(`  - LLM Model: ${llmConfig.model}`);
+        this.logger.info(`  - Embedding Model: ${embeddingConfig.model}`);
         this.logger.info(`  - Collection: manus_memory_${taskType}`);
-        this.logger.info(`  - History DB: ${dbPath}`);
-        this.logger.info(`  - Vector DB: ${vectorDbPath}`);
+        this.logger.debug(`  - LLM Config:`, JSON.stringify(llmConfig, null, 2));
+        this.logger.debug(`  - Embedding Config:`, JSON.stringify(embeddingConfig, null, 2));
+        this.logger.debug(`  - Mem0 Config:`, JSON.stringify(mem0Config, null, 2));
+        this.logger.debug(`  - Memory instance type: ${this.memory.constructor.name}`);
+        this.logger.debug(`  - Memory.fromConfig available: ${!!Memory.fromConfig}`);
+        // this.logger.info(`  - History DB: ${dbPath}`);
+        // this.logger.info(`  - Vector DB: ${vectorDbPath}`);
       } catch (error) {
         this.logger.error(`Failed to initialize Mem0: ${error}`);
+        this.logger.error(`Error details:`, error);
         throw error;
       }
     } else {
@@ -125,10 +148,17 @@ export class Mem0MemoryManager {
     metadata?: Record<string, any>
   ): Promise<MemoryAddResult> {
     if (!this.isEnabled() || !this.memory) {
+      this.logger.warn(
+        'Memory manager is disabled or memory not initialized - cannot add conversation'
+      );
       return { success: false, error: 'Memory manager is disabled' };
     }
 
     try {
+      this.logger.debug(
+        `Adding conversation with ${messages.length} messages for userId: ${this.userId}`
+      );
+
       // 转换消息格式为Mem0格式
       const mem0Messages = messages.map((msg) => ({
         role: msg.role,
@@ -138,19 +168,25 @@ export class Mem0MemoryManager {
         ...(msg.name && { name: msg.name }),
       }));
 
+      this.logger.debug(`Mem0 formatted messages:`, JSON.stringify(mem0Messages, null, 2));
+      this.logger.debug(`Metadata:`, JSON.stringify(metadata, null, 2));
+
       // 添加到Mem0
       const result = await this.memory.add(mem0Messages, {
         userId: this.userId,
         ...metadata,
       });
 
+      this.logger.debug(`Mem0 add result:`, JSON.stringify(result, null, 2));
       this.logger.info(`Added conversation to memory`);
+
       return {
         success: true,
         memoryId: result.results?.[0]?.id,
       };
     } catch (error) {
       this.logger.error(`Failed to add conversation to memory: ${error}`);
+      this.logger.error(`Error details:`, error);
       return { success: false, error: String(error) };
     }
   }
@@ -185,15 +221,27 @@ export class Mem0MemoryManager {
    */
   async searchMemories(query: string, limit?: number): Promise<MemorySearchResult[]> {
     if (!this.isEnabled() || !this.memory) {
+      this.logger.warn('Memory manager is disabled or memory not initialized');
       return [];
     }
 
     try {
       const searchLimit = limit || this.config.searchLimit;
+
+      this.logger.debug(
+        `Searching memories with query: "${query}" (limit: ${searchLimit}, userId: ${this.userId})`
+      );
+
+      // 先检查是否有任何记忆存在
+      const allMemories = await this.getAllMemories();
+      this.logger.debug(`Total memories in database: ${allMemories.length}`);
+
       const results = await this.memory.search(query, {
         userId: this.userId,
         limit: searchLimit,
       });
+
+      this.logger.debug(`Raw search results from Mem0:`, JSON.stringify(results, null, 2));
 
       const memories: MemorySearchResult[] =
         results.results?.map((result) => ({
@@ -205,9 +253,17 @@ export class Mem0MemoryManager {
       this.logger.info(
         `Found ${memories.length} relevant memories for query: ${query.substring(0, 50)}...`
       );
+
+      if (memories.length === 0 && allMemories.length > 0) {
+        this.logger.warn(
+          `No search results found despite having ${allMemories.length} total memories. This might indicate a search configuration issue.`
+        );
+      }
+
       return memories;
     } catch (error) {
       this.logger.error(`Failed to search memories: ${error}`);
+      this.logger.error(`Error details:`, error);
       return [];
     }
   }
@@ -217,11 +273,18 @@ export class Mem0MemoryManager {
    */
   async getAllMemories(): Promise<MemorySearchResult[]> {
     if (!this.isEnabled() || !this.memory) {
+      this.logger.warn(
+        'Memory manager is disabled or memory not initialized - cannot get memories'
+      );
       return [];
     }
 
     try {
+      this.logger.debug(`Getting all memories for userId: ${this.userId}`);
+
       const results = await this.memory.getAll({ userId: this.userId });
+
+      this.logger.debug(`Raw getAll results from Mem0:`, JSON.stringify(results, null, 2));
 
       const memories: MemorySearchResult[] =
         results.results?.map((result: any) => ({
@@ -234,6 +297,7 @@ export class Mem0MemoryManager {
       return memories;
     } catch (error) {
       this.logger.error(`Failed to get all memories: ${error}`);
+      this.logger.error(`Error details:`, error);
       return [];
     }
   }
@@ -276,7 +340,7 @@ export class Mem0MemoryManager {
 
   /**
    * 智能压缩消息历史
-   * 根据相关性和重要性选择保留的消息
+   * 根据相关性和重要性选择保留的消息，去除重复内容但保留跟踪信息
    */
   async getRelevantContext(currentQuery: string, allMessages: Message[]): Promise<Message[]> {
     if (!this.isEnabled()) {
@@ -289,35 +353,110 @@ export class Mem0MemoryManager {
       const relevantMemories = await this.searchMemories(currentQuery, this.config.searchLimit);
 
       if (relevantMemories.length === 0) {
-        // 没有找到相关记忆，返回最近的消息
-        return allMessages.slice(-this.config.maxContextMessages);
+        // 没有找到相关记忆，采用混合策略：取前5条和后面的maxContextMessages条
+        this.logger.debug('No relevant memories found, using hybrid message selection strategy');
+        return this.selectHybridMessages(allMessages);
       }
 
       // 构建上下文消息
       const contextMessages: Message[] = [];
 
-      // 添加系统消息（如果有）
-      const systemMessages = allMessages.filter((msg) => msg.role === Role.SYSTEM);
-      contextMessages.push(...systemMessages);
+      // 用于去重的Set，基于消息内容和角色
+      const seenMessages = new Set<string>();
 
-      // 添加相关记忆作为系统消息
+      // 辅助函数：生成消息的唯一标识（用于去重）
+      const getMessageKey = (msg: Message): string => {
+        return `${msg.role}:${msg.content?.substring(0, 100) || ''}`;
+      };
+
+      // 辅助函数：安全添加消息（避免重复）
+      const addUniqueMessage = (msg: Message): void => {
+        const key = getMessageKey(msg);
+        if (!seenMessages.has(key)) {
+          seenMessages.add(key);
+          contextMessages.push(msg);
+        }
+      };
+
+      // 1. 首先添加系统消息（保持在最前面）
+      const systemMessages = allMessages.filter((msg) => msg.role === Role.SYSTEM);
+      systemMessages.forEach(addUniqueMessage);
+
+      // 2. 添加相关记忆作为系统消息（如果有且不重复）
       if (relevantMemories.length > 0) {
-        const memoryContext = relevantMemories.map((mem) => `记忆: ${mem.memory}`).join('\n');
-        contextMessages.push(Message.systemMessage(`相关记忆:\n${memoryContext}`));
+        const memoryContext = relevantMemories
+          .map((mem, index) => `[记忆${index + 1}]: ${mem.memory}`)
+          .join('\n');
+        const memoryMessage = Message.systemMessage(
+          `=== 相关记忆上下文 ===\n${memoryContext}\n=== 记忆结束 ===`
+        );
+        addUniqueMessage(memoryMessage);
       }
 
-      // 添加最近的几条消息
-      const recentMessages = allMessages.slice(-this.config.maxContextMessages);
-      contextMessages.push(...recentMessages);
+      // 3. 添加最近的非系统消息（按时间顺序，避免重复）
+      const recentNonSystemMessages = allMessages
+        .filter((msg) => msg.role !== Role.SYSTEM)
+        .slice(-this.config.maxContextMessages);
+
+      recentNonSystemMessages.forEach(addUniqueMessage);
+
+      // 记录构建的上下文信息
+      const messageStats = {
+        total: contextMessages.length,
+        system: contextMessages.filter((msg) => msg.role === Role.SYSTEM).length,
+        user: contextMessages.filter((msg) => msg.role === Role.USER).length,
+        assistant: contextMessages.filter((msg) => msg.role === Role.ASSISTANT).length,
+        memories: relevantMemories.length,
+        originalTotal: allMessages.length,
+      };
 
       this.logger.info(
-        `Built context with ${contextMessages.length} messages including ${relevantMemories.length} relevant memories`
+        `Built deduplicated context: ${messageStats.total} messages ` +
+          `(${messageStats.system} system, ${messageStats.user} user, ${messageStats.assistant} assistant) ` +
+          `with ${messageStats.memories} memories from ${messageStats.originalTotal} original messages`
       );
+
       return contextMessages;
     } catch (error) {
       this.logger.error(`Failed to get relevant context: ${error}`);
-      // 出错时返回最近的消息
-      return allMessages.slice(-this.config.maxContextMessages);
+      // 出错时也使用混合策略：取前5条和后面的maxContextMessages条
+      this.logger.debug('Error occurred, falling back to hybrid message selection strategy');
+      return this.selectHybridMessages(allMessages);
+    }
+  }
+
+  /**
+   * 记录对话内容到记忆中
+   * @param role 角色：user 或 assistant
+   * @param content 对话内容
+   * @param metadata 元数据
+   */
+  async recordConversation(
+    role: 'user' | 'assistant',
+    content: string,
+    metadata?: any
+  ): Promise<void> {
+    try {
+      if (!this.isEnabled() || !content || content.length < 5) {
+        return;
+      }
+
+      // 转换角色为正确的 Role 枚举值并创建 Message 对象
+      const messageRole = role === 'user' ? Role.USER : Role.ASSISTANT;
+      const message = new Message({
+        role: messageRole,
+        content: content,
+      });
+
+      const result = await this.addConversation([message], metadata);
+
+      if (!result.success) {
+        this.logger.warn(`Failed to record conversation: ${result.error}`);
+      } else {
+        this.logger.debug(`Recorded conversation for ${role}: ${content.substring(0, 100)}...`);
+      }
+    } catch (error) {
+      this.logger.error('Error recording conversation:', error);
     }
   }
 
@@ -363,6 +502,49 @@ export class Mem0MemoryManager {
    */
   private getDefaultVectorDbPath(): string {
     return path.join('.manus', 'vector_db');
+  }
+
+  /**
+   * 混合消息选择策略：取前5条和后面的maxContextMessages条
+   * 用于在没有相关记忆或出错时的回退方案
+   */
+  private selectHybridMessages(allMessages: Message[]): Message[] {
+    const maxContext = this.config.maxContextMessages;
+    const prefixCount = Math.min(5, allMessages.length);
+
+    if (allMessages.length <= maxContext) {
+      // 如果总消息数不超过maxContext，返回所有消息
+      return allMessages;
+    }
+
+    // 取前5条消息
+    const prefixMessages = allMessages.slice(0, prefixCount);
+
+    // 计算剩余可用的消息数量
+    const remainingSlots = maxContext - prefixCount;
+
+    if (remainingSlots > 0) {
+      // 取最后的remainingSlots条消息，但要避免与前5条重复
+      const suffixMessages = allMessages.slice(-remainingSlots);
+
+      // 合并前缀和后缀消息，去除重复
+      const seenIndices = new Set(Array.from({ length: prefixCount }, (_, i) => i));
+      const uniqueSuffixMessages = suffixMessages.filter((_, index) => {
+        const originalIndex = allMessages.length - remainingSlots + index;
+        return !seenIndices.has(originalIndex);
+      });
+
+      const hybridMessages = [...prefixMessages, ...uniqueSuffixMessages];
+      this.logger.debug(
+        `Hybrid strategy: ${prefixCount} prefix + ${uniqueSuffixMessages.length} suffix = ${hybridMessages.length} total messages`
+      );
+
+      return hybridMessages;
+    } else {
+      // 如果剩余槽位为0或负数，只返回前5条
+      this.logger.debug(`Using only prefix messages: ${prefixMessages.length} messages`);
+      return prefixMessages;
+    }
   }
 
   /**

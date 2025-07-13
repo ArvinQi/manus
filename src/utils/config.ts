@@ -223,7 +223,7 @@ export class Config {
       maxTokenLimit: 4000,
       relevanceThreshold: 0.5,
       importanceThreshold: 0.6,
-      sessionTimeoutMs: 30 * 60 * 1000, // 30分钟
+      sessionTimeoutMs: 120 * 60 * 1000, // 2小时 (原来是30分钟)
       summarizationThreshold: 20,
     };
   }

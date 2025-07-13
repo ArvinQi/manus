@@ -9,7 +9,34 @@
       "api_type": "openai",
       "api_version": "2023-12-01-preview"
     },
-    "fast": {
+    "coder": {
+      "model": "gpt-3.5-turbo",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "max_tokens": 1000,
+      "temperature": 0.5,
+      "api_type": "openai",
+      "api_version": "2023-12-01-preview"
+    },
+    "mem0": {
+      "model": "gpt-3.5-turbo",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "max_tokens": 1000,
+      "temperature": 0.5,
+      "api_type": "openai",
+      "api_version": "2023-12-01-preview"
+    },
+    "embedding": {
+      "model": "gpt-3.5-turbo",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "${OPENAI_API_KEY}",
+      "max_tokens": 1000,
+      "temperature": 0.5,
+      "api_type": "openai",
+      "api_version": "2023-12-01-preview"
+    },
+    "vision": {
       "model": "gpt-3.5-turbo",
       "base_url": "https://api.openai.com/v1",
       "api_key": "${OPENAI_API_KEY}",
