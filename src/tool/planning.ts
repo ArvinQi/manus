@@ -30,10 +30,7 @@ interface Plan {
 type PlanningCommand = 'create' | 'update' | 'list' | 'get' | 'set_active' | 'mark_step' | 'delete';
 
 // 工具描述
-const PLANNING_TOOL_DESCRIPTION = `
-A planning tool that allows the agent to create and manage plans for solving complex tasks.
-The tool provides functionality for creating plans, updating plan steps, and tracking progress.
-`;
+const PLANNING_TOOL_DESCRIPTION = `规划工具，使智能体能够创建和管理解决复杂任务的计划。该工具提供创建计划、更新计划步骤以及跟踪进度的功能。`;
 
 /**
  * PlanningTool 类
@@ -47,37 +44,35 @@ export class PlanningTool extends BaseTool {
     properties: {
       command: {
         description:
-          'The command to execute. Available commands: create, update, list, get, set_active, mark_step, delete.',
+          '要执行的命令。可用命令：create（创建）, update（更新）, list（列表）, get（获取）, set_active（设置活跃）, mark_step（标记步骤）, delete（删除）。',
         enum: ['create', 'update', 'list', 'get', 'set_active', 'mark_step', 'delete'],
         type: 'string',
       },
       plan_id: {
         description:
-          'Unique identifier for the plan. Required for create, update, set_active, and delete commands. Optional for get and mark_step (uses active plan if not specified).',
+          '计划的唯一标识符。create、update、set_active 和 delete 命令必需。get 和 mark_step 命令可选（如果未指定则使用活跃计划）。',
         type: 'string',
       },
       title: {
-        description:
-          'Title for the plan. Required for create command, optional for update command.',
+        description: '计划的标题。create 命令必需，update 命令可选。',
         type: 'string',
       },
       steps: {
-        description:
-          'List of plan steps. Required for create command, optional for update command.',
+        description: '计划步骤列表。create 命令必需，update 命令可选。',
         type: 'array',
         items: { type: 'string' },
       },
       step_index: {
-        description: 'Index of the step to update (0-based). Required for mark_step command.',
+        description: '要更新的步骤索引（从0开始）。mark_step 命令必需。',
         type: 'integer',
       },
       step_status: {
-        description: 'Status to set for a step. Used with mark_step command.',
+        description: '要为步骤设置的状态。与 mark_step 命令一起使用。',
         enum: ['not_started', 'in_progress', 'completed', 'blocked'],
         type: 'string',
       },
       step_notes: {
-        description: 'Additional notes for a step. Optional for mark_step command.',
+        description: '步骤的额外备注。mark_step 命令可选。',
         type: 'string',
       },
     },

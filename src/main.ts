@@ -24,7 +24,7 @@ const logger = new Logger('Main');
 export async function main() {
   const continueTask = process.argv.includes('--continue');
   // const useMcpServer = process.argv.includes('--use-mcp-server');
-  const maxSteps = parseInt(process.argv[3], 10) || 100;
+  const maxSteps = parseInt(process.argv[3], 10) || 1000;
 
   // 检查是否指定了MD文件
   const fileArgIndex = process.argv.indexOf('--file');

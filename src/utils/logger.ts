@@ -13,7 +13,10 @@ export class Logger {
   private logFilePath: string;
   private useConsole: boolean;
 
-  constructor(context: string, options: { useConsole?: boolean; logToFile?: boolean } = {}) {
+  constructor(
+    context: string,
+    options: { useConsole?: boolean; logToFile?: boolean; category?: string } = {}
+  ) {
     this.context = context;
     this.useConsole = options.useConsole !== false; // 默认使用控制台输出
 
@@ -42,8 +45,54 @@ export class Logger {
       fs.mkdirSync(manusDir);
     }
 
+    // 根据分类创建子目录
+    const category = options.category || this.getCategoryFromContext(context);
+    const categoryDir = path.join(manusDir, category);
+    if (!fs.existsSync(categoryDir)) {
+      fs.mkdirSync(categoryDir, { recursive: true });
+    }
+
     // 为每个上下文创建独立的日志文件
-    this.logFilePath = path.join(manusDir, `${context.toLowerCase()}.log`);
+    this.logFilePath = path.join(categoryDir, `${context.toLowerCase()}.log`);
+  }
+
+  /**
+   * 根据上下文自动判断分类
+   */
+  private getCategoryFromContext(context: string): string {
+    const lowerContext = context.toLowerCase();
+
+    // 内存相关
+    if (lowerContext.includes('memory') || lowerContext.includes('mem0')) {
+      return 'memory';
+    }
+
+    // 任务相关
+    if (lowerContext.includes('task') || lowerContext.includes('plan')) {
+      return 'tasks';
+    }
+
+    // 工具相关
+    if (lowerContext.includes('tool') || lowerContext.includes('mcp')) {
+      return 'tools';
+    }
+
+    // 代理相关
+    if (lowerContext.includes('agent') || lowerContext.includes('manus')) {
+      return 'agents';
+    }
+
+    // 核心系统
+    if (
+      lowerContext.includes('system') ||
+      lowerContext.includes('core') ||
+      lowerContext.includes('config')
+    ) {
+      return 'system';
+    }
+
+    // 默认为logs
+    return 'logs';
   }
 
   /**
@@ -102,9 +151,14 @@ export class Logger {
       args,
     };
     try {
-      fs.appendFileSync(this.logFilePath, JSON.stringify(logEntry) + '\n');
+      if (fs.existsSync(this.logFilePath)) {
+        fs.appendFileSync(this.logFilePath, JSON.stringify(logEntry) + '\n');
+      } else {
+        fs.mkdirSync(path.dirname(this.logFilePath), { recursive: true });
+        fs.writeFileSync(this.logFilePath, JSON.stringify(logEntry) + '\n');
+      }
     } catch (e) {
-      // ignore file write errors
+      console.error('🚀🚀🚀🚀🚀🚀 ~ Logger ~ appendLog ~ e:', e);
     }
   }
 }

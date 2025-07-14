@@ -156,7 +156,7 @@ class TaskManager {
     this.workspaceRoot = workspaceRoot;
     this.taskDir = path.join(workspaceRoot, '.manus', 'tasks');
     this.logger = new Logger('TaskManager');
-    this.ensureTaskDirectory();
+    // 不在构造函数中立即创建目录，而是在需要时才创建
   }
 
   /**
@@ -166,90 +166,6 @@ class TaskManager {
     if (!fs.existsSync(this.taskDir)) {
       fs.mkdirSync(this.taskDir, { recursive: true });
     }
-  }
-
-  /**
-   * 备份现有的.manus目录
-   * 如果.manus目录存在，将其重命名为.manus_backup_[timestamp]
-   */
-  private backupManusDirectory(): void {
-    try {
-      const manusDir = path.join(this.workspaceRoot, '.manus');
-
-      // 检查.manus目录是否存在
-      if (!fs.existsSync(manusDir)) {
-        this.logger.info('.manus目录不存在，无需备份');
-        return;
-      }
-
-      // 生成备份目录名称（使用本地时间，方便阅读）
-      const now = new Date();
-      const year = now.getFullYear();
-      const month = String(now.getMonth() + 1).padStart(2, '0');
-      const day = String(now.getDate()).padStart(2, '0');
-      const hour = String(now.getHours()).padStart(2, '0');
-      const minute = String(now.getMinutes()).padStart(2, '0');
-      const second = String(now.getSeconds()).padStart(2, '0');
-
-      const timestamp = `${year}-${month}-${day}_${hour}-${minute}-${second}`;
-      const backupDir = path.join(this.workspaceRoot, `.manus_backup_${timestamp}`);
-
-      // 重命名目录进行备份
-      fs.renameSync(manusDir, backupDir);
-      this.logger.info(`已备份.manus目录到: ${path.basename(backupDir)}`);
-
-      // 清理旧的备份（保留最近10个备份）
-      this.cleanupOldBackups();
-    } catch (error) {
-      this.logger.error(`备份.manus目录失败: ${(error as Error).message}`);
-      // 备份失败不应该阻止任务创建，继续执行
-    }
-  }
-
-  /**
-   * 清理旧的备份目录，只保留最近的10个备份
-   */
-  private cleanupOldBackups(): void {
-    try {
-      const backupPattern = /^\.manus_backup_/;
-      const allItems = fs.readdirSync(this.workspaceRoot);
-
-      // 找出所有备份目录
-      const backupDirs = allItems
-        .filter((item) => {
-          const fullPath = path.join(this.workspaceRoot, item);
-          return backupPattern.test(item) && fs.statSync(fullPath).isDirectory();
-        })
-        .map((item) => ({
-          name: item,
-          path: path.join(this.workspaceRoot, item),
-          mtime: fs.statSync(path.join(this.workspaceRoot, item)).mtime,
-        }))
-        .sort((a, b) => b.mtime.getTime() - a.mtime.getTime()); // 按修改时间降序排列
-
-      // 如果备份目录超过10个，删除最旧的
-      if (backupDirs.length > 10) {
-        const dirsToDelete = backupDirs.slice(10);
-        for (const dir of dirsToDelete) {
-          try {
-            fs.rmSync(dir.path, { recursive: true, force: true });
-            this.logger.info(`已清理旧备份: ${dir.name}`);
-          } catch (error) {
-            this.logger.warn(`清理备份失败: ${dir.name} - ${(error as Error).message}`);
-          }
-        }
-      }
-    } catch (error) {
-      this.logger.error(`清理旧备份失败: ${(error as Error).message}`);
-    }
-  }
-
-  /**
-   * 备份.manus目录（公共方法）
-   * 在初始化或创建新任务时调用
-   */
-  backupIfNeeded(): void {
-    this.backupManusDirectory();
   }
 
   /**
@@ -304,6 +220,7 @@ class TaskManager {
    */
   loadTask(taskId?: string): TaskPersistence | null {
     try {
+      this.ensureTaskDirectory();
       const taskFile = path.join(this.taskDir, TaskManager.CURRENT_TASK_FILE);
       if (!fs.existsSync(taskFile)) {
         return null;
@@ -333,6 +250,7 @@ class TaskManager {
    */
   getRecentTask(): TaskPersistence | null {
     try {
+      this.ensureTaskDirectory();
       const taskFile = path.join(this.taskDir, TaskManager.CURRENT_TASK_FILE);
       if (!fs.existsSync(taskFile)) {
         return null;
@@ -365,6 +283,7 @@ class TaskManager {
    */
   private saveTask(task: TaskPersistence): void {
     try {
+      this.ensureTaskDirectory();
       task.updatedAt = Date.now();
       const taskFile = path.join(this.taskDir, TaskManager.CURRENT_TASK_FILE);
       fs.writeFileSync(taskFile, JSON.stringify(task, null, 2));
@@ -378,6 +297,7 @@ class TaskManager {
    */
   private saveTaskToHistory(task: TaskPersistence): void {
     try {
+      this.ensureTaskDirectory();
       const historyFile = path.join(this.taskDir, TaskManager.TASK_HISTORY_FILE);
       let history: TaskPersistence[] = [];
 
@@ -754,6 +674,7 @@ class TaskManager {
    */
   getTaskHistory(limit: number = 10): TaskPersistence[] {
     try {
+      this.ensureTaskDirectory();
       const historyFile = path.join(this.taskDir, TaskManager.TASK_HISTORY_FILE);
       if (!fs.existsSync(historyFile)) {
         return [];
@@ -775,6 +696,7 @@ class TaskManager {
    */
   cleanupExpiredHistory(maxAge: number = 30 * 24 * 60 * 60 * 1000): void {
     try {
+      this.ensureTaskDirectory();
       const historyFile = path.join(this.taskDir, TaskManager.TASK_HISTORY_FILE);
       if (!fs.existsSync(historyFile)) {
         return;
@@ -858,6 +780,7 @@ export class Manus extends ToolCallAgent {
       tools?: ToolCollection;
       useMcpServer?: boolean;
       multiAgentSystem?: MultiAgentSystem;
+      continueTask?: boolean;
     } = {}
   ) {
     super({
@@ -872,6 +795,11 @@ export class Manus extends ToolCallAgent {
       toolChoice: ToolChoice.AUTO,
       specialToolNames: ['Terminate'],
     });
+
+    // 如果不是继续任务模式，先备份现有的.manus目录
+    if (!options.continueTask) {
+      this.backupManusDirectory();
+    }
 
     // 初始化任务管理器
     this.taskManager = new TaskManager(config.getWorkspaceRoot());
@@ -923,6 +851,83 @@ export class Manus extends ToolCallAgent {
   }
 
   /**
+   * 备份现有的.manus目录
+   * 如果.manus目录存在，将其重命名为.manus_backup_[timestamp]
+   */
+  private backupManusDirectory(): void {
+    try {
+      const workspaceRoot = config.getWorkspaceRoot();
+      const manusDir = path.join(workspaceRoot, '.manus');
+
+      // 检查.manus目录是否存在
+      if (!fs.existsSync(manusDir)) {
+        console.log('.manus目录不存在，无需备份');
+        return;
+      }
+
+      // 生成备份目录名称（使用本地时间，方便阅读）
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const day = String(now.getDate()).padStart(2, '0');
+      const hour = String(now.getHours()).padStart(2, '0');
+      const minute = String(now.getMinutes()).padStart(2, '0');
+      const second = String(now.getSeconds()).padStart(2, '0');
+
+      const timestamp = `${year}-${month}-${day}_${hour}-${minute}-${second}`;
+      const backupDir = path.join(workspaceRoot, `.manus_backup_${timestamp}`);
+
+      // 重命名目录进行备份
+      fs.renameSync(manusDir, backupDir);
+      console.log(`已备份.manus目录到: ${path.basename(backupDir)}`);
+
+      // 清理旧的备份（保留最近10个备份）
+      this.cleanupOldBackups(workspaceRoot);
+    } catch (error) {
+      console.error(`备份.manus目录失败: ${(error as Error).message}`);
+      // 备份失败不应该阻止任务创建，继续执行
+    }
+  }
+
+  /**
+   * 清理旧的备份目录，只保留最近的10个备份
+   */
+  private cleanupOldBackups(workspaceRoot: string): void {
+    try {
+      const backupPattern = /^\.manus_backup_/;
+      const allItems = fs.readdirSync(workspaceRoot);
+
+      // 找出所有备份目录
+      const backupDirs = allItems
+        .filter((item) => {
+          const fullPath = path.join(workspaceRoot, item);
+          return backupPattern.test(item) && fs.statSync(fullPath).isDirectory();
+        })
+        .map((item) => ({
+          name: item,
+          path: path.join(workspaceRoot, item),
+          mtime: fs.statSync(path.join(workspaceRoot, item)).mtime,
+        }))
+        .sort((a, b) => b.mtime.getTime() - a.mtime.getTime()); // 按修改时间降序排列
+
+      // 如果备份目录超过10个，删除最旧的
+      if (backupDirs.length > 10) {
+        const dirsToDelete = backupDirs.slice(10);
+        for (const dir of dirsToDelete) {
+          try {
+            fs.rmSync(dir.path, { recursive: true, force: true });
+            console.log(`已清理旧备份: ${dir.name}`);
+          } catch (error) {
+            console.warn(`清理备份失败: ${dir.name} - ${(error as Error).message}`);
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`清理旧备份失败: ${(error as Error).message}`);
+    }
+  }
+
+  /**
    * 创建并初始化 Manus 实例的工厂方法
    */
   static async create(
@@ -953,12 +958,6 @@ export class Manus extends ToolCallAgent {
     useMcpServer: boolean = false,
     continueTask: boolean = false
   ): Promise<void> {
-    // 如果不是继续任务模式，先备份现有的.manus目录
-    if (!continueTask) {
-      this.taskManager.backupIfNeeded();
-      this.logger.info('非继续任务模式，已自动备份现有.manus目录');
-    }
-
     // 尝试加载或恢复任务
     if (continueTask) {
       const recentTask = this.taskManager.getRecentTask();

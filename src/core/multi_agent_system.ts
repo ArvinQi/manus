@@ -595,7 +595,6 @@ export class MultiAgentSystem extends EventEmitter {
       const importanceScore = severity === 'error' ? 0.9 : severity === 'warning' ? 0.7 : 0.5;
       await this.memoryManager.recordImportantEvent(type, data, importanceScore);
     } catch (error) {
-      console.log('🚀🚀🚀🚀🚀🚀 ~ MultiAgentSystem ~ error:', error);
       this.logger.error(`记录系统事件失败: ${error}`);
     }
 

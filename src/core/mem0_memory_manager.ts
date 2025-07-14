@@ -116,11 +116,6 @@ export class Mem0MemoryManager {
         this.logger.info(`  - LLM Model: ${llmConfig.model}`);
         this.logger.info(`  - Embedding Model: ${embeddingConfig.model}`);
         this.logger.info(`  - Collection: manus_memory_${taskType}`);
-        this.logger.debug(`  - LLM Config:`, JSON.stringify(llmConfig, null, 2));
-        this.logger.debug(`  - Embedding Config:`, JSON.stringify(embeddingConfig, null, 2));
-        this.logger.debug(`  - Mem0 Config:`, JSON.stringify(mem0Config, null, 2));
-        this.logger.debug(`  - Memory instance type: ${this.memory.constructor.name}`);
-        this.logger.debug(`  - Memory.fromConfig available: ${!!Memory.fromConfig}`);
         // this.logger.info(`  - History DB: ${dbPath}`);
         // this.logger.info(`  - Vector DB: ${vectorDbPath}`);
       } catch (error) {
@@ -155,10 +150,6 @@ export class Mem0MemoryManager {
     }
 
     try {
-      this.logger.debug(
-        `Adding conversation with ${messages.length} messages for userId: ${this.userId}`
-      );
-
       // 转换消息格式为Mem0格式
       const mem0Messages = messages.map((msg) => ({
         role: msg.role,
@@ -168,16 +159,12 @@ export class Mem0MemoryManager {
         ...(msg.name && { name: msg.name }),
       }));
 
-      this.logger.debug(`Mem0 formatted messages:`, JSON.stringify(mem0Messages, null, 2));
-      this.logger.debug(`Metadata:`, JSON.stringify(metadata, null, 2));
-
       // 添加到Mem0
       const result = await this.memory.add(mem0Messages, {
         userId: this.userId,
         ...metadata,
       });
 
-      this.logger.debug(`Mem0 add result:`, JSON.stringify(result, null, 2));
       this.logger.info(`Added conversation to memory`);
 
       return {
@@ -228,20 +215,13 @@ export class Mem0MemoryManager {
     try {
       const searchLimit = limit || this.config.searchLimit;
 
-      this.logger.debug(
-        `Searching memories with query: "${query}" (limit: ${searchLimit}, userId: ${this.userId})`
-      );
-
       // 先检查是否有任何记忆存在
       const allMemories = await this.getAllMemories();
-      this.logger.debug(`Total memories in database: ${allMemories.length}`);
 
       const results = await this.memory.search(query, {
         userId: this.userId,
         limit: searchLimit,
       });
-
-      this.logger.debug(`Raw search results from Mem0:`, JSON.stringify(results, null, 2));
 
       const memories: MemorySearchResult[] =
         results.results?.map((result) => ({
@@ -280,11 +260,7 @@ export class Mem0MemoryManager {
     }
 
     try {
-      this.logger.debug(`Getting all memories for userId: ${this.userId}`);
-
       const results = await this.memory.getAll({ userId: this.userId });
-
-      this.logger.debug(`Raw getAll results from Mem0:`, JSON.stringify(results, null, 2));
 
       const memories: MemorySearchResult[] =
         results.results?.map((result: any) => ({
@@ -382,7 +358,14 @@ export class Mem0MemoryManager {
       const systemMessages = allMessages.filter((msg) => msg.role === Role.SYSTEM);
       systemMessages.forEach(addUniqueMessage);
 
-      // 2. 添加相关记忆作为系统消息（如果有且不重复）
+      // 2. 添加第一条用户消息（最高优先级，永远放在第一位）
+      const firstUserMessage = allMessages.find((msg) => msg.role === Role.USER);
+      if (firstUserMessage) {
+        addUniqueMessage(firstUserMessage);
+        this.logger.debug('Added first user message with highest priority');
+      }
+
+      // 3. 添加相关记忆作为系统消息（如果有且不重复）
       if (relevantMemories.length > 0) {
         const memoryContext = relevantMemories
           .map((mem, index) => `[记忆${index + 1}]: ${mem.memory}`)
@@ -393,7 +376,7 @@ export class Mem0MemoryManager {
         addUniqueMessage(memoryMessage);
       }
 
-      // 3. 添加最近的非系统消息（按时间顺序，避免重复）
+      // 4. 添加最近的非系统消息（按时间顺序，避免重复）
       const recentNonSystemMessages = allMessages
         .filter((msg) => msg.role !== Role.SYSTEM)
         .slice(-this.config.maxContextMessages);
@@ -507,44 +490,67 @@ export class Mem0MemoryManager {
   /**
    * 混合消息选择策略：取前5条和后面的maxContextMessages条
    * 用于在没有相关记忆或出错时的回退方案
+   * 确保第一条用户消息始终具有最高优先级
    */
   private selectHybridMessages(allMessages: Message[]): Message[] {
     const maxContext = this.config.maxContextMessages;
-    const prefixCount = Math.min(5, allMessages.length);
 
     if (allMessages.length <= maxContext) {
       // 如果总消息数不超过maxContext，返回所有消息
       return allMessages;
     }
 
-    // 取前5条消息
-    const prefixMessages = allMessages.slice(0, prefixCount);
+    // 构建优先级消息列表
+    const priorityMessages: Message[] = [];
+    const seenMessages = new Set<string>();
 
-    // 计算剩余可用的消息数量
-    const remainingSlots = maxContext - prefixCount;
+    // 辅助函数：生成消息的唯一标识（用于去重）
+    const getMessageKey = (msg: Message): string => {
+      return `${msg.role}:${msg.content?.substring(0, 100) || ''}`;
+    };
+
+    // 辅助函数：安全添加消息（避免重复）
+    const addUniqueMessage = (msg: Message): boolean => {
+      const key = getMessageKey(msg);
+      if (!seenMessages.has(key)) {
+        seenMessages.add(key);
+        priorityMessages.push(msg);
+        return true;
+      }
+      return false;
+    };
+
+    // 1. 首先添加系统消息
+    const systemMessages = allMessages.filter((msg) => msg.role === Role.SYSTEM);
+    systemMessages.forEach(addUniqueMessage);
+
+    // 2. 添加第一条用户消息（最高优先级）
+    const firstUserMessage = allMessages.find((msg) => msg.role === Role.USER);
+    if (firstUserMessage) {
+      addUniqueMessage(firstUserMessage);
+      this.logger.debug('Added first user message with highest priority in hybrid strategy');
+    }
+
+    // 3. 添加前几条消息（跳过已添加的）
+    const prefixCount = Math.min(5, allMessages.length);
+    const prefixMessages = allMessages.slice(0, prefixCount);
+    prefixMessages.forEach(addUniqueMessage);
+
+    // 4. 计算剩余可用的消息数量
+    const remainingSlots = maxContext - priorityMessages.length;
 
     if (remainingSlots > 0) {
-      // 取最后的remainingSlots条消息，但要避免与前5条重复
+      // 取最后的remainingSlots条消息
       const suffixMessages = allMessages.slice(-remainingSlots);
-
-      // 合并前缀和后缀消息，去除重复
-      const seenIndices = new Set(Array.from({ length: prefixCount }, (_, i) => i));
-      const uniqueSuffixMessages = suffixMessages.filter((_, index) => {
-        const originalIndex = allMessages.length - remainingSlots + index;
-        return !seenIndices.has(originalIndex);
-      });
-
-      const hybridMessages = [...prefixMessages, ...uniqueSuffixMessages];
-      this.logger.debug(
-        `Hybrid strategy: ${prefixCount} prefix + ${uniqueSuffixMessages.length} suffix = ${hybridMessages.length} total messages`
-      );
-
-      return hybridMessages;
-    } else {
-      // 如果剩余槽位为0或负数，只返回前5条
-      this.logger.debug(`Using only prefix messages: ${prefixMessages.length} messages`);
-      return prefixMessages;
+      suffixMessages.forEach(addUniqueMessage);
     }
+
+    this.logger.debug(
+      `Hybrid strategy: ${priorityMessages.length} total messages ` +
+        `(${systemMessages.length} system, first user message priority, remaining context)`
+    );
+
+    return priorityMessages;
   }
 
   /**
