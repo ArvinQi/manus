@@ -158,6 +158,10 @@ export class ToolCallAgent extends ReActAgent {
     // 过滤掉重复的用户提示消息
     olderMessages = this.filterDuplicateMessages(olderMessages);
 
+    // *** 关键修复：确保工具调用和结果的配对完整性 ***
+    // 移除所有孤立的工具调用或工具结果，防止Claude API错误
+    olderMessages = this.removeUnpairedToolMessages(olderMessages);
+
     // 如果较早的消息中已经包含摘要消息（以系统消息形式），则需要特殊处理
     const existingSummaryIndex = olderMessages.findIndex(
       (msg) => msg.role === 'system' && msg.content && msg.content.startsWith('以下是之前')
@@ -189,11 +193,8 @@ export class ToolCallAgent extends ReActAgent {
             // 使用智能压缩处理内容
             content = this.compressMessageContent(content, 150);
 
-            // 如果是工具调用消息，添加工具名称
-            if (msg.tool_calls && msg.tool_calls.length > 0) {
-              const toolNames = msg.tool_calls.map((tc) => tc.function.name).join(', ');
-              return `- ${msg.role} [工具: ${toolNames}]: ${content}`;
-            }
+            // *** 修复：移除工具调用相关的特殊处理，因为已经过滤掉了 ***
+            // 只保留普通消息内容的摘要
             return `- ${msg.role}: ${content}`;
           })
           .join('\n');
@@ -207,6 +208,73 @@ export class ToolCallAgent extends ReActAgent {
     this.logger.info(
       `🔄 消息已摘要处理：${olderMessages.length} 条消息被摘要为 1 条，保留最近 ${recentMessages.length} 条消息`
     );
+  }
+
+  /**
+   * 移除不完整的工具调用消息对，防止Claude API错误
+   * Claude API要求每个toolUse都必须有对应的toolResult
+   */
+  private removeUnpairedToolMessages(messages: Message[]): Message[] {
+    const result: Message[] = [];
+    const toolCallIds = new Set<string>();
+    const toolResultIds = new Set<string>();
+
+    // 第一遍：收集所有工具调用ID和工具结果ID
+    for (const message of messages) {
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        message.tool_calls.forEach((call) => {
+          toolCallIds.add(call.id);
+        });
+      }
+      if (message.tool_call_id) {
+        toolResultIds.add(message.tool_call_id);
+      }
+    }
+
+    // 第二遍：只保留有完整配对的工具调用消息
+    for (const message of messages) {
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        // 检查工具调用是否都有对应的结果
+        const completePairs = message.tool_calls.filter((call) => toolResultIds.has(call.id));
+
+        if (completePairs.length === message.tool_calls.length) {
+          // 所有工具调用都有对应结果，保留原消息
+          result.push(message);
+        } else if (completePairs.length > 0) {
+          // 部分工具调用有结果，创建新消息只包含完整的配对
+          result.push(
+            new Message({
+              role: message.role,
+              content: message.content,
+              tool_calls: completePairs,
+            })
+          );
+        } else {
+          // 没有完整配对，只保留文本内容
+          if (message.content) {
+            result.push(
+              new Message({
+                role: message.role,
+                content: message.content,
+              })
+            );
+          }
+        }
+      } else if (message.tool_call_id) {
+        // 工具结果消息：只保留有对应工具调用的结果
+        if (toolCallIds.has(message.tool_call_id)) {
+          result.push(message);
+        }
+        // 否则跳过孤立的工具结果
+      } else {
+        // 普通消息，直接保留
+        result.push(message);
+      }
+    }
+
+    this.logger.debug(`工具消息配对验证：原始${messages.length}条，过滤后${result.length}条消息`);
+
+    return result;
   }
 
   /**
@@ -243,6 +311,9 @@ export class ToolCallAgent extends ReActAgent {
     try {
       // 获取当前查询用于上下文获取
       const currentQuery = this.extractCurrentQuery();
+
+      // 添加调试日志来跟踪currentQuery的变化
+      this.logger.debug(`当前查询提取: "${currentQuery}"`);
 
       // 使用Agent的智能上下文管理获取相关消息
       const contextualMessages = await this.getContextualMessages(currentQuery);

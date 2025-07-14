@@ -23,6 +23,10 @@ export interface MessageContext {
   relevanceScore?: number;
   sessionId?: string;
   topicId?: string;
+  // 新增：标记是否为受保护的消息（如首次任务消息）
+  isProtected?: boolean;
+  // 新增：消息类型标识
+  messageType?: 'task_creation' | 'task_instruction' | 'important_user_input' | 'normal';
 }
 
 export interface ConversationSession {
@@ -77,8 +81,12 @@ export class ConversationContextManager {
       return;
     }
 
-    // 计算消息重要性
-    const importance = this.calculateMessageImportance(message);
+    // 检测消息类型和是否需要保护
+    const messageType = this.detectMessageType(message, metadata);
+    const isProtected = this.shouldProtectMessage(message, messageType, metadata);
+
+    // 计算消息重要性（如果是保护消息，设置高重要性）
+    const importance = isProtected ? 1.0 : this.calculateMessageImportance(message);
 
     // 检测主题
     const topicId = this.detectMessageTopic(message);
@@ -92,6 +100,8 @@ export class ConversationContextManager {
       importance,
       sessionId,
       topicId,
+      isProtected,
+      messageType,
     };
 
     // 添加到当前会话
@@ -154,6 +164,96 @@ export class ConversationContextManager {
       this.logger.error(`Failed to get relevant context: ${error}`);
       return this.getFallbackContext(limit);
     }
+  }
+
+  /**
+   * 检测消息类型
+   */
+  private detectMessageType(
+    message: Message,
+    metadata?: Record<string, any>
+  ): MessageContext['messageType'] {
+    const content = message.content?.toLowerCase() || '';
+
+    // 检查元数据中的任务相关信息
+    if (metadata?.isTaskCreation || metadata?.isFirstTask) {
+      return 'task_creation';
+    }
+
+    // 检查内容中的任务创建关键词
+    if (
+      content.includes('创建任务') ||
+      content.includes('新任务') ||
+      content.includes('开始任务') ||
+      content.includes('第一个任务') ||
+      content.includes('首次任务') ||
+      content.includes('初始任务')
+    ) {
+      return 'task_creation';
+    }
+
+    // 检查任务指令关键词
+    if (
+      content.includes('执行') ||
+      content.includes('完成') ||
+      content.includes('处理') ||
+      content.includes('帮我') ||
+      content.includes('请') ||
+      (content.includes('任务') && content.length > 20)
+    ) {
+      return 'task_instruction';
+    }
+
+    // 检查重要用户输入
+    if (
+      message.role === Role.USER &&
+      (content.includes('重要') ||
+        content.includes('关键') ||
+        content.includes('必须') ||
+        content.includes('一定要') ||
+        content.length > 100)
+    ) {
+      return 'important_user_input';
+    }
+
+    return 'normal';
+  }
+
+  /**
+   * 判断消息是否需要保护
+   */
+  private shouldProtectMessage(
+    message: Message,
+    messageType: MessageContext['messageType'],
+    metadata?: Record<string, any>
+  ): boolean {
+    // 明确标记为保护的消息
+    if (metadata?.isProtected) {
+      return true;
+    }
+
+    // 任务创建消息必须保护
+    if (messageType === 'task_creation') {
+      return true;
+    }
+
+    // 会话开始的前几条用户消息保护（特别是首次任务）
+    if (message.role === Role.USER && this.currentSessionId) {
+      const currentSession = this.sessions.get(this.currentSessionId);
+      if (
+        currentSession &&
+        currentSession.messages.filter((m) => m.message.role === Role.USER).length <= 2
+      ) {
+        return true;
+      }
+    }
+
+    // 长度超过一定阈值的用户消息保护
+    if (message.role === Role.USER && (message.content?.length || 0) > 200) {
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -457,8 +557,27 @@ export class ConversationContextManager {
    * 应用token限制
    */
   private applyTokenLimit(messages: MessageContext[], maxMessages: number): MessageContext[] {
-    // 简单实现：按消息数量限制
-    const result = messages.slice(0, maxMessages);
+    // 首先分离受保护的消息和普通消息
+    const protectedMessages = messages.filter((m) => m.isProtected);
+    const normalMessages = messages.filter((m) => !m.isProtected);
+
+    // 如果受保护的消息数量已经超过限制，优先保留最重要的受保护消息
+    if (protectedMessages.length >= maxMessages) {
+      this.logger.warn(
+        `Protected messages exceed limit, keeping ${maxMessages} most important ones`
+      );
+      return protectedMessages.sort((a, b) => b.importance - a.importance).slice(0, maxMessages);
+    }
+
+    // 计算剩余可用位置
+    const remainingSlots = maxMessages - protectedMessages.length;
+
+    // 从普通消息中选择最相关和最重要的
+    const selectedNormalMessages = normalMessages
+      .sort(
+        (a, b) => (b.relevanceScore || 0) + b.importance - ((a.relevanceScore || 0) + a.importance)
+      )
+      .slice(0, remainingSlots);
 
     // 确保包含最近的几条消息
     if (this.currentSessionId) {
@@ -466,19 +585,32 @@ export class ConversationContextManager {
       if (currentSession) {
         const recentMessages = currentSession.messages.slice(-3);
 
-        // 合并去重
-        const allMessages = [...result];
         for (const recent of recentMessages) {
-          if (!allMessages.find((m) => m.timestamp === recent.timestamp)) {
-            allMessages.push(recent);
+          if (
+            !protectedMessages.find((m) => m.timestamp === recent.timestamp) &&
+            !selectedNormalMessages.find((m) => m.timestamp === recent.timestamp)
+          ) {
+            // 如果还有空间，添加最近消息
+            if (selectedNormalMessages.length < remainingSlots) {
+              selectedNormalMessages.push(recent);
+            } else {
+              // 替换最不重要的消息
+              const leastImportant = selectedNormalMessages.sort(
+                (a, b) => a.importance - b.importance
+              )[0];
+              if (leastImportant && recent.importance >= leastImportant.importance) {
+                const index = selectedNormalMessages.indexOf(leastImportant);
+                selectedNormalMessages[index] = recent;
+              }
+            }
           }
         }
-
-        return allMessages.slice(0, maxMessages);
       }
     }
 
-    return result;
+    // 合并并按时间排序
+    const finalMessages = [...protectedMessages, ...selectedNormalMessages];
+    return finalMessages.sort((a, b) => a.timestamp - b.timestamp);
   }
 
   /**
@@ -489,7 +621,90 @@ export class ConversationContextManager {
     const sortedByTime = messageContexts.sort((a, b) => a.timestamp - b.timestamp);
 
     // 提取消息
-    return sortedByTime.map((ctx) => ctx.message);
+    const messages = sortedByTime.map((ctx) => ctx.message);
+
+    // *** 关键修复：确保工具调用和结果的配对完整性，防止Claude API错误 ***
+    const validatedMessages = this.validateToolCallIntegrity(messages);
+
+    return validatedMessages;
+  }
+
+  /**
+   * 验证工具调用完整性
+   * 确保工具调用和工具结果正确配对，防止API错误
+   */
+  private validateToolCallIntegrity(messages: Message[]): Message[] {
+    const result: Message[] = [];
+    const toolCallIds = new Set<string>();
+    const toolResultIds = new Set<string>();
+
+    // 第一遍：收集所有工具调用ID和工具结果ID
+    for (const message of messages) {
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        message.tool_calls.forEach((call) => {
+          if (call.id) {
+            toolCallIds.add(call.id);
+          }
+        });
+      }
+      if (message.tool_call_id) {
+        toolResultIds.add(message.tool_call_id);
+      }
+    }
+
+    // 第二遍：只保留有完整配对的工具调用消息
+    for (const message of messages) {
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        // 检查工具调用是否都有对应的结果
+        const completePairs = message.tool_calls.filter((call) =>
+          call.id && toolResultIds.has(call.id)
+        );
+
+        if (completePairs.length === message.tool_calls.length) {
+          // 所有工具调用都有对应结果，保留原消息
+          result.push(message);
+        } else if (completePairs.length > 0) {
+          // 部分工具调用有结果，创建新消息只包含完整的配对
+          result.push({
+            role: message.role,
+            content: message.content,
+            tool_calls: completePairs,
+            ...(message.tool_call_id && { tool_call_id: message.tool_call_id }),
+            ...(message.name && { name: message.name }),
+            ...(message.base64_image && { base64_image: message.base64_image }),
+          } as Message);
+        } else {
+          // 没有完整配对，只保留文本内容
+          if (message.content) {
+            result.push({
+              role: message.role,
+              content: message.content,
+              ...(message.base64_image && { base64_image: message.base64_image }),
+            } as Message);
+          }
+        }
+      } else if (message.tool_call_id) {
+        // 工具结果消息：只保留有对应工具调用的结果
+        if (toolCallIds.has(message.tool_call_id)) {
+          result.push(message);
+        } else {
+          this.logger.debug(
+            `Removing orphaned tool result: ${message.tool_call_id} (no matching tool call)`
+          );
+        }
+      } else {
+        // 普通消息，直接保留
+        result.push(message);
+      }
+    }
+
+    if (result.length !== messages.length) {
+      this.logger.debug(
+        `Tool call integrity validation: ${messages.length} -> ${result.length} messages`
+      );
+    }
+
+    return result;
   }
 
   /**

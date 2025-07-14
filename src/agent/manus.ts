@@ -1,6 +1,7 @@
 /**
  * Manus 类
  * 一个多功能的通用代理，支持多种工具
+ * 重构版本：优化任务持久化和继续执行功能
  */
 
 import { ToolCallAgent } from './toolcall.js';
@@ -15,23 +16,801 @@ import { z } from 'zod';
 import { BaseTool } from '../tool/base.js';
 import { MultiAgentSystem } from '../core/multi_agent_system.js';
 import { ToolRouter, RoutingStrategy } from '../core/tool_router.js';
+import {
+  ConversationContextManager,
+  ConversationConfig,
+} from '../core/conversation_context_manager.js';
+import { Message, Role } from '../schema/index.js';
+import { PlanManager, Plan, PlanStep, StepStatus as PlanStepStatus } from '../core/plan_manager.js';
 
 // 系统提示词
 const SYSTEM_PROMPT = `你是一个功能强大的智能助手，可以帮助用户完成各种任务。
-你可以使用多种工具来解决问题，包括搜索、浏览器操作、代码执行等。
+你可以使用多种工具来解决问题，包括命令行、文件操作、搜索、浏览器操作、代码执行等。
 当需要时，你应该主动使用这些工具来获取信息或执行操作。
 
-如果当前存在任务计划，你必须继续执行任务计划，直到任务完成。即使对话被中断，当恢复时，你应该回顾之前的上下文并继续未完成的任务。
+任务执行原则：
+1. 首先分析任务需求，制定详细的执行计划
+2. 按步骤执行，每步完成后评估结果并更新进度
+3. 自动保存任务状态，支持中断后继续执行
+4. 遇到错误时自动重试和恢复，不知道下一步时从计划工具获取当前计划分析下一步
+5. 持续优化执行策略，提高成功率
 
-代码任务需要先分析需求和项目环境，然后使用合适的工具来生成代码。
-你的工作目录是: {directory}`;
+当前工作目录: {directory}
+任务状态将自动保存到 .manus 目录中，支持中断后继续执行。`;
 
 // 下一步提示词
-const NEXT_STEP_PROMPT = '请思考下一步应该做什么，并使用适当的工具来完成任务。';
+const NEXT_STEP_PROMPT = '请分析当前任务状态，思考下一步应该做什么，并使用适当的工具来完成任务。';
+
+// 任务状态枚举
+enum TaskStatus {
+  PENDING = 'pending',
+  RUNNING = 'running',
+  PAUSED = 'paused',
+  COMPLETED = 'completed',
+  FAILED = 'failed',
+  CANCELLED = 'cancelled',
+}
+
+// 任务步骤状态枚举
+enum StepStatus {
+  PENDING = 'pending',
+  RUNNING = 'running',
+  COMPLETED = 'completed',
+  FAILED = 'failed',
+  SKIPPED = 'skipped',
+}
+
+// 任务步骤接口
+interface TaskStep {
+  id: string;
+  title: string;
+  description: string;
+  status: StepStatus;
+  startTime?: number;
+  endTime?: number;
+  result?: any;
+  error?: string;
+  retryCount: number;
+  maxRetries: number;
+  dependencies: string[];
+  estimatedDuration?: number;
+  actualDuration?: number;
+}
+
+// 任务持久化接口
+interface TaskPersistence {
+  id: string;
+  title: string;
+  description: string;
+  status: TaskStatus;
+  createdAt: number;
+  updatedAt: number;
+  startTime?: number;
+  endTime?: number;
+  steps: TaskStep[];
+  currentStepIndex: number;
+  context: Record<string, any>;
+  metadata: {
+    totalSteps: number;
+    completedSteps: number;
+    failedSteps: number;
+    progress: number;
+    estimatedCompletionTime?: number;
+    actualCompletionTime?: number;
+    sourceFile?: string;
+    userId?: string;
+  };
+  checkpoints: TaskCheckpoint[];
+  executionHistory: ExecutionEvent[];
+}
+
+// 任务检查点接口
+interface TaskCheckpoint {
+  id: string;
+  timestamp: number;
+  stepIndex: number;
+  context: Record<string, any>;
+  description: string;
+}
+
+// 执行事件接口
+interface ExecutionEvent {
+  id: string;
+  timestamp: number;
+  type:
+    | 'step_start'
+    | 'step_complete'
+    | 'step_fail'
+    | 'step_retry'
+    | 'step_skip'
+    | 'task_start'
+    | 'task_complete'
+    | 'task_fail'
+    | 'task_pause'
+    | 'task_resume'
+    | 'error'
+    | 'checkpoint';
+  stepId?: string;
+  description: string;
+  data?: any;
+}
 
 /**
- * Manus 类
+ * 任务管理器类
+ * 负责任务的创建、执行、持久化和恢复
+ * 使用固定文件名避免多个任务计划同时存在
+ */
+class TaskManager {
+  private workspaceRoot: string;
+  private taskDir: string;
+  private logger: Logger;
+  private currentTask?: TaskPersistence;
+  private autoSaveInterval?: NodeJS.Timeout;
+  private checkpointInterval?: NodeJS.Timeout;
+
+  // 固定的任务文件名
+  private static readonly CURRENT_TASK_FILE = 'current_task.json';
+  private static readonly TASK_HISTORY_FILE = 'task_history.json';
+
+  constructor(workspaceRoot: string) {
+    this.workspaceRoot = workspaceRoot;
+    this.taskDir = path.join(workspaceRoot, '.manus', 'tasks');
+    this.logger = new Logger('TaskManager');
+    this.ensureTaskDirectory();
+  }
+
+  /**
+   * 确保任务目录存在
+   */
+  private ensureTaskDirectory(): void {
+    if (!fs.existsSync(this.taskDir)) {
+      fs.mkdirSync(this.taskDir, { recursive: true });
+    }
+  }
+
+  /**
+   * 备份现有的.manus目录
+   * 如果.manus目录存在，将其重命名为.manus_backup_[timestamp]
+   */
+  private backupManusDirectory(): void {
+    try {
+      const manusDir = path.join(this.workspaceRoot, '.manus');
+
+      // 检查.manus目录是否存在
+      if (!fs.existsSync(manusDir)) {
+        this.logger.info('.manus目录不存在，无需备份');
+        return;
+      }
+
+      // 生成备份目录名称（使用本地时间，方便阅读）
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const day = String(now.getDate()).padStart(2, '0');
+      const hour = String(now.getHours()).padStart(2, '0');
+      const minute = String(now.getMinutes()).padStart(2, '0');
+      const second = String(now.getSeconds()).padStart(2, '0');
+
+      const timestamp = `${year}-${month}-${day}_${hour}-${minute}-${second}`;
+      const backupDir = path.join(this.workspaceRoot, `.manus_backup_${timestamp}`);
+
+      // 重命名目录进行备份
+      fs.renameSync(manusDir, backupDir);
+      this.logger.info(`已备份.manus目录到: ${path.basename(backupDir)}`);
+
+      // 清理旧的备份（保留最近10个备份）
+      this.cleanupOldBackups();
+    } catch (error) {
+      this.logger.error(`备份.manus目录失败: ${(error as Error).message}`);
+      // 备份失败不应该阻止任务创建，继续执行
+    }
+  }
+
+  /**
+   * 清理旧的备份目录，只保留最近的10个备份
+   */
+  private cleanupOldBackups(): void {
+    try {
+      const backupPattern = /^\.manus_backup_/;
+      const allItems = fs.readdirSync(this.workspaceRoot);
+
+      // 找出所有备份目录
+      const backupDirs = allItems
+        .filter((item) => {
+          const fullPath = path.join(this.workspaceRoot, item);
+          return backupPattern.test(item) && fs.statSync(fullPath).isDirectory();
+        })
+        .map((item) => ({
+          name: item,
+          path: path.join(this.workspaceRoot, item),
+          mtime: fs.statSync(path.join(this.workspaceRoot, item)).mtime,
+        }))
+        .sort((a, b) => b.mtime.getTime() - a.mtime.getTime()); // 按修改时间降序排列
+
+      // 如果备份目录超过10个，删除最旧的
+      if (backupDirs.length > 10) {
+        const dirsToDelete = backupDirs.slice(10);
+        for (const dir of dirsToDelete) {
+          try {
+            fs.rmSync(dir.path, { recursive: true, force: true });
+            this.logger.info(`已清理旧备份: ${dir.name}`);
+          } catch (error) {
+            this.logger.warn(`清理备份失败: ${dir.name} - ${(error as Error).message}`);
+          }
+        }
+      }
+    } catch (error) {
+      this.logger.error(`清理旧备份失败: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * 备份.manus目录（公共方法）
+   * 在初始化或创建新任务时调用
+   */
+  backupIfNeeded(): void {
+    this.backupManusDirectory();
+  }
+
+  /**
+   * 创建新任务
+   * 使用固定文件名，新任务会覆盖旧任务
+   */
+  createTask(title: string, description: string, steps: Omit<TaskStep, 'id'>[]): TaskPersistence {
+    // 确保任务目录存在（备份后重新创建）
+    this.ensureTaskDirectory();
+
+    // 在创建新任务之前，先保存当前任务到历史记录
+    if (this.currentTask) {
+      this.saveTaskToHistory(this.currentTask);
+    }
+
+    const taskId = this.generateTaskId();
+    const now = Date.now();
+
+    const task: TaskPersistence = {
+      id: taskId,
+      title,
+      description,
+      status: TaskStatus.PENDING,
+      createdAt: now,
+      updatedAt: now,
+      steps: steps.map((step, index) => ({
+        ...step,
+        id: `${taskId}_step_${index}`,
+      })),
+      currentStepIndex: 0,
+      context: {},
+      metadata: {
+        totalSteps: steps.length,
+        completedSteps: 0,
+        failedSteps: 0,
+        progress: 0,
+      },
+      checkpoints: [],
+      executionHistory: [],
+    };
+
+    this.currentTask = task;
+    this.saveTask(task);
+    this.startAutoSave();
+
+    this.logger.info(`新任务已创建: ${title} (ID: ${taskId})`);
+    return task;
+  }
+
+  /**
+   * 加载当前任务
+   */
+  loadTask(taskId?: string): TaskPersistence | null {
+    try {
+      const taskFile = path.join(this.taskDir, TaskManager.CURRENT_TASK_FILE);
+      if (!fs.existsSync(taskFile)) {
+        return null;
+      }
+
+      const taskData = JSON.parse(fs.readFileSync(taskFile, 'utf-8'));
+
+      // 如果指定了taskId，检查是否匹配
+      if (taskId && taskData.id !== taskId) {
+        this.logger.warn(`任务ID不匹配: 期望 ${taskId}, 实际 ${taskData.id}`);
+        return null;
+      }
+
+      this.currentTask = taskData;
+      this.startAutoSave();
+
+      this.logger.info(`任务已加载: ${taskData.title} (ID: ${taskData.id})`);
+      return taskData;
+    } catch (error) {
+      this.logger.error(`加载任务失败: ${(error as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * 获取当前任务（如果存在且有效）
+   */
+  getRecentTask(): TaskPersistence | null {
+    try {
+      const taskFile = path.join(this.taskDir, TaskManager.CURRENT_TASK_FILE);
+      if (!fs.existsSync(taskFile)) {
+        return null;
+      }
+
+      const taskData = JSON.parse(fs.readFileSync(taskFile, 'utf-8'));
+
+      // 检查任务是否在最近24小时内更新
+      const maxAge = 24 * 60 * 60 * 1000; // 24小时
+      if (Date.now() - taskData.updatedAt > maxAge) {
+        this.logger.info('当前任务已过期，忽略');
+        return null;
+      }
+
+      // 只返回未完成的任务
+      if (taskData.status === TaskStatus.COMPLETED || taskData.status === TaskStatus.CANCELLED) {
+        this.logger.info('当前任务已完成或已取消，忽略');
+        return null;
+      }
+
+      return taskData;
+    } catch (error) {
+      this.logger.error(`获取当前任务失败: ${(error as Error).message}`);
+      return null;
+    }
+  }
+
+  /**
+   * 保存任务到固定文件
+   */
+  private saveTask(task: TaskPersistence): void {
+    try {
+      task.updatedAt = Date.now();
+      const taskFile = path.join(this.taskDir, TaskManager.CURRENT_TASK_FILE);
+      fs.writeFileSync(taskFile, JSON.stringify(task, null, 2));
+    } catch (error) {
+      this.logger.error(`保存任务失败: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * 保存任务到历史记录
+   */
+  private saveTaskToHistory(task: TaskPersistence): void {
+    try {
+      const historyFile = path.join(this.taskDir, TaskManager.TASK_HISTORY_FILE);
+      let history: TaskPersistence[] = [];
+
+      // 读取现有历史记录
+      if (fs.existsSync(historyFile)) {
+        try {
+          const historyData = fs.readFileSync(historyFile, 'utf-8');
+          history = JSON.parse(historyData);
+        } catch (error) {
+          this.logger.warn(`读取历史记录失败，将创建新的历史记录: ${(error as Error).message}`);
+        }
+      }
+
+      // 添加当前任务到历史记录
+      history.push({
+        ...task,
+        endTime: Date.now(),
+      });
+
+      // 保持历史记录数量限制（最多保留100个）
+      if (history.length > 100) {
+        history = history.slice(-100);
+      }
+
+      // 保存历史记录
+      fs.writeFileSync(historyFile, JSON.stringify(history, null, 2));
+      this.logger.info(`任务已保存到历史记录: ${task.title}`);
+    } catch (error) {
+      this.logger.error(`保存历史记录失败: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * 启动当前任务
+   */
+  startTask(): boolean {
+    if (!this.currentTask) {
+      return false;
+    }
+
+    this.currentTask.status = TaskStatus.RUNNING;
+    this.currentTask.startTime = Date.now();
+    this.addExecutionEvent('task_start', '任务开始执行');
+    this.saveTask(this.currentTask);
+    this.startCheckpointSaver();
+
+    this.logger.info(`任务开始执行: ${this.currentTask.title}`);
+    return true;
+  }
+
+  /**
+   * 暂停当前任务
+   */
+  pauseTask(): boolean {
+    if (!this.currentTask || this.currentTask.status !== TaskStatus.RUNNING) {
+      return false;
+    }
+
+    this.currentTask.status = TaskStatus.PAUSED;
+    this.addExecutionEvent('task_pause', '任务暂停');
+    this.createCheckpoint('任务暂停检查点');
+    this.saveTask(this.currentTask);
+
+    this.logger.info(`任务已暂停: ${this.currentTask.title}`);
+    return true;
+  }
+
+  /**
+   * 恢复当前任务
+   */
+  resumeTask(): boolean {
+    if (!this.currentTask || this.currentTask.status !== TaskStatus.PAUSED) {
+      return false;
+    }
+
+    this.currentTask.status = TaskStatus.RUNNING;
+    this.addExecutionEvent('task_resume', '任务恢复执行');
+    this.saveTask(this.currentTask);
+    this.startCheckpointSaver();
+
+    this.logger.info(`任务已恢复: ${this.currentTask.title}`);
+    return true;
+  }
+
+  /**
+   * 完成当前任务
+   */
+  completeTask(): boolean {
+    if (!this.currentTask) {
+      return false;
+    }
+
+    this.currentTask.status = TaskStatus.COMPLETED;
+    this.currentTask.endTime = Date.now();
+    this.currentTask.metadata.actualCompletionTime = this.currentTask.endTime;
+    this.addExecutionEvent('task_complete', '任务完成');
+    this.saveTask(this.currentTask);
+    this.stopAutoSave();
+
+    this.logger.info(`任务已完成: ${this.currentTask.title}`);
+    return true;
+  }
+
+  /**
+   * 获取当前步骤
+   */
+  getCurrentStep(): TaskStep | null {
+    if (!this.currentTask || this.currentTask.currentStepIndex >= this.currentTask.steps.length) {
+      return null;
+    }
+
+    return this.currentTask.steps[this.currentTask.currentStepIndex];
+  }
+
+  /**
+   * 开始当前步骤
+   */
+  startCurrentStep(): boolean {
+    const step = this.getCurrentStep();
+    if (!step) {
+      return false;
+    }
+
+    step.status = StepStatus.RUNNING;
+    step.startTime = Date.now();
+    this.addExecutionEvent('step_start', `开始执行步骤: ${step.title}`, step.id);
+    this.saveTask(this.currentTask!);
+
+    this.logger.info(`开始执行步骤: ${step.title}`);
+    return true;
+  }
+
+  /**
+   * 完成当前步骤
+   */
+  completeCurrentStep(result?: any): boolean {
+    const step = this.getCurrentStep();
+    if (!step) {
+      return false;
+    }
+
+    step.status = StepStatus.COMPLETED;
+    step.endTime = Date.now();
+    step.result = result;
+    step.actualDuration = step.endTime - (step.startTime || step.endTime);
+
+    this.currentTask!.currentStepIndex++;
+    this.currentTask!.metadata.completedSteps++;
+    this.updateProgress();
+
+    this.addExecutionEvent('step_complete', `完成步骤: ${step.title}`, step.id);
+    this.createCheckpoint(`步骤完成检查点: ${step.title}`);
+    this.saveTask(this.currentTask!);
+
+    this.logger.info(`步骤完成: ${step.title}`);
+
+    // 检查是否所有步骤都完成
+    if (this.currentTask!.currentStepIndex >= this.currentTask!.steps.length) {
+      this.completeTask();
+    }
+
+    return true;
+  }
+
+  /**
+   * 当前步骤失败
+   */
+  failCurrentStep(error: string): boolean {
+    const step = this.getCurrentStep();
+    if (!step) {
+      return false;
+    }
+
+    step.retryCount++;
+    step.error = error;
+
+    // 检查是否可以重试
+    if (step.retryCount <= step.maxRetries) {
+      this.addExecutionEvent(
+        'step_retry',
+        `步骤重试: ${step.title} (第${step.retryCount}次)`,
+        step.id
+      );
+      this.logger.warn(`步骤重试: ${step.title} (第${step.retryCount}次)`);
+      return true;
+    }
+
+    // 标记步骤失败
+    step.status = StepStatus.FAILED;
+    step.endTime = Date.now();
+    step.actualDuration = step.endTime - (step.startTime || step.endTime);
+
+    this.currentTask!.metadata.failedSteps++;
+    this.updateProgress();
+
+    this.addExecutionEvent('step_fail', `步骤失败: ${step.title}`, step.id);
+    this.saveTask(this.currentTask!);
+
+    this.logger.error(`步骤失败: ${step.title} - ${error}`);
+
+    // 检查是否应该终止任务
+    if (this.shouldTerminateTask()) {
+      this.currentTask!.status = TaskStatus.FAILED;
+      this.addExecutionEvent('task_fail', '任务因步骤失败而终止');
+      this.saveTask(this.currentTask!);
+      this.stopAutoSave();
+    }
+
+    return false;
+  }
+
+  /**
+   * 跳过当前步骤
+   */
+  skipCurrentStep(reason: string): boolean {
+    const step = this.getCurrentStep();
+    if (!step) {
+      return false;
+    }
+
+    step.status = StepStatus.SKIPPED;
+    step.endTime = Date.now();
+    step.error = reason;
+
+    this.currentTask!.currentStepIndex++;
+    this.updateProgress();
+
+    this.addExecutionEvent('step_skip', `跳过步骤: ${step.title} - ${reason}`, step.id);
+    this.saveTask(this.currentTask!);
+
+    this.logger.info(`跳过步骤: ${step.title} - ${reason}`);
+    return true;
+  }
+
+  /**
+   * 更新任务进度
+   */
+  private updateProgress(): void {
+    if (!this.currentTask) return;
+
+    const { totalSteps, completedSteps, failedSteps } = this.currentTask.metadata;
+    this.currentTask.metadata.progress = ((completedSteps + failedSteps) / totalSteps) * 100;
+  }
+
+  /**
+   * 创建检查点
+   */
+  private createCheckpoint(description: string): void {
+    if (!this.currentTask) return;
+
+    const checkpoint: TaskCheckpoint = {
+      id: `checkpoint_${Date.now()}`,
+      timestamp: Date.now(),
+      stepIndex: this.currentTask.currentStepIndex,
+      context: { ...this.currentTask.context },
+      description,
+    };
+
+    this.currentTask.checkpoints.push(checkpoint);
+    this.addExecutionEvent('checkpoint', description);
+  }
+
+  /**
+   * 添加执行事件
+   */
+  private addExecutionEvent(
+    type: ExecutionEvent['type'],
+    description: string,
+    stepId?: string,
+    data?: any
+  ): void {
+    if (!this.currentTask) return;
+
+    const event: ExecutionEvent = {
+      id: `event_${Date.now()}`,
+      timestamp: Date.now(),
+      type,
+      stepId,
+      description,
+      data,
+    };
+
+    this.currentTask.executionHistory.push(event);
+  }
+
+  /**
+   * 是否应该终止任务
+   */
+  private shouldTerminateTask(): boolean {
+    if (!this.currentTask) return false;
+
+    const { totalSteps, failedSteps } = this.currentTask.metadata;
+    // 如果失败步骤超过总步骤的50%，终止任务
+    return failedSteps > totalSteps * 0.5;
+  }
+
+  /**
+   * 开始自动保存
+   */
+  private startAutoSave(): void {
+    if (this.autoSaveInterval) {
+      clearInterval(this.autoSaveInterval);
+    }
+
+    this.autoSaveInterval = setInterval(() => {
+      if (this.currentTask) {
+        this.saveTask(this.currentTask);
+      }
+    }, 10000); // 每10秒保存一次
+  }
+
+  /**
+   * 停止自动保存
+   */
+  private stopAutoSave(): void {
+    if (this.autoSaveInterval) {
+      clearInterval(this.autoSaveInterval);
+      this.autoSaveInterval = undefined;
+    }
+    if (this.checkpointInterval) {
+      clearInterval(this.checkpointInterval);
+      this.checkpointInterval = undefined;
+    }
+  }
+
+  /**
+   * 开始检查点保存
+   */
+  private startCheckpointSaver(): void {
+    if (this.checkpointInterval) {
+      clearInterval(this.checkpointInterval);
+    }
+
+    this.checkpointInterval = setInterval(() => {
+      if (this.currentTask && this.currentTask.status === TaskStatus.RUNNING) {
+        this.createCheckpoint('定时检查点');
+      }
+    }, 30000); // 每30秒创建一个检查点
+  }
+
+  /**
+   * 生成任务ID
+   */
+  private generateTaskId(): string {
+    return `task_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  }
+
+  /**
+   * 获取当前任务
+   */
+  getCurrentTask(): TaskPersistence | undefined {
+    return this.currentTask;
+  }
+
+  /**
+   * 设置任务上下文
+   */
+  setTaskContext(key: string, value: any): void {
+    if (this.currentTask) {
+      this.currentTask.context[key] = value;
+      this.saveTask(this.currentTask);
+    }
+  }
+
+  /**
+   * 获取任务上下文
+   */
+  getTaskContext(key: string): any {
+    return this.currentTask?.context[key];
+  }
+
+  /**
+   * 获取任务历史记录
+   */
+  getTaskHistory(limit: number = 10): TaskPersistence[] {
+    try {
+      const historyFile = path.join(this.taskDir, TaskManager.TASK_HISTORY_FILE);
+      if (!fs.existsSync(historyFile)) {
+        return [];
+      }
+
+      const historyData = fs.readFileSync(historyFile, 'utf-8');
+      const history: TaskPersistence[] = JSON.parse(historyData);
+
+      // 返回最近的记录
+      return history.slice(-limit).reverse();
+    } catch (error) {
+      this.logger.error(`获取任务历史记录失败: ${(error as Error).message}`);
+      return [];
+    }
+  }
+
+  /**
+   * 清理过期的任务历史记录
+   */
+  cleanupExpiredHistory(maxAge: number = 30 * 24 * 60 * 60 * 1000): void {
+    try {
+      const historyFile = path.join(this.taskDir, TaskManager.TASK_HISTORY_FILE);
+      if (!fs.existsSync(historyFile)) {
+        return;
+      }
+
+      const historyData = fs.readFileSync(historyFile, 'utf-8');
+      const history: TaskPersistence[] = JSON.parse(historyData);
+
+      const now = Date.now();
+      const filteredHistory = history.filter((task) => {
+        const taskAge = now - task.updatedAt;
+        return taskAge < maxAge;
+      });
+
+      if (filteredHistory.length !== history.length) {
+        fs.writeFileSync(historyFile, JSON.stringify(filteredHistory, null, 2));
+        this.logger.info(`清理了 ${history.length - filteredHistory.length} 条过期的历史记录`);
+      }
+    } catch (error) {
+      this.logger.error(`清理历史记录失败: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * 清理资源
+   */
+  cleanup(): void {
+    this.stopAutoSave();
+    this.currentTask = undefined;
+  }
+}
+
+/**
+ * Manus 类 - 重构版本
  * 一个多功能的通用代理，支持多种工具
+ * 优化了任务持久化和继续执行功能
  */
 export class Manus extends ToolCallAgent {
   // 浏览器上下文助手
@@ -40,11 +819,8 @@ export class Manus extends ToolCallAgent {
   // 是否已初始化
   private _initialized: boolean = false;
 
-  // MCP 服务器进程（如果需要的话）
+  // MCP 服务器进程
   private mcpServerProcess?: any;
-
-  // MCP 客户端（通过多智能体系统管理）
-  // protected mcpClient?: McpClient;
 
   // 多智能体系统
   protected multiAgentSystem?: MultiAgentSystem;
@@ -52,19 +828,23 @@ export class Manus extends ToolCallAgent {
   // 工具路由器
   protected toolRouter?: ToolRouter;
 
-  // 任务状态相关属性
-  private _taskState: {
-    currentTask?: string; // 当前正在执行的任务描述
-    originalTaskDescription?: string; // 原始任务描述（来自文件或用户输入）
-    taskPlan?: string[]; // 任务计划步骤列表
-    currentStepIndex?: number; // 当前执行到的步骤索引
-    completedSteps?: string[]; // 已完成的步骤列表
-    taskContext?: Map<string, any>; // 任务上下文信息，存储任务执行过程中的关键数据
-    lastActiveTime?: number; // 最后活动时间戳
-    isTaskActive?: boolean; // 任务是否处于活动状态
-    taskStartTime?: number; // 任务开始时间
-    taskSourceFile?: string; // 任务来源文件路径
-  } = {};
+  // 任务管理器
+  private taskManager: TaskManager;
+
+  // 计划管理器
+  private planManager: PlanManager;
+
+  // 对话上下文管理器
+  private conversationContextManager: ConversationContextManager;
+
+  // 执行统计
+  private executionStats = {
+    totalSteps: 0,
+    successfulSteps: 0,
+    failedSteps: 0,
+    retriedSteps: 0,
+    averageStepDuration: 0,
+  };
 
   constructor(
     options: {
@@ -77,52 +857,69 @@ export class Manus extends ToolCallAgent {
       llmConfigName?: string;
       tools?: ToolCollection;
       useMcpServer?: boolean;
-      enableTaskContinuity?: boolean; // 是否启用任务连续性功能
       multiAgentSystem?: MultiAgentSystem;
     } = {}
   ) {
     super({
       name: options.name || 'Manus',
-      description: options.description || '一个多功能的通用代理，可以使用多种工具解决各种任务',
+      description: options.description || '一个多功能的通用代理，支持任务持久化和继续执行',
       systemPrompt:
         options.systemPrompt || SYSTEM_PROMPT.replace('{directory}', config.getWorkspaceRoot()),
       nextStepPrompt: options.nextStepPrompt || NEXT_STEP_PROMPT,
-      maxSteps: options.maxSteps || 20,
+      maxSteps: options.maxSteps || 30,
       llmConfigName: options.llmConfigName || 'default',
       tools: options.tools || new ToolCollection(),
       toolChoice: ToolChoice.AUTO,
       specialToolNames: ['Terminate'],
     });
 
-    // MCP 客户端现在通过多智能体系统管理
+    // 初始化任务管理器
+    this.taskManager = new TaskManager(config.getWorkspaceRoot());
+
+    // 初始化计划管理器
+    this.planManager = new PlanManager({
+      workspaceRoot: config.getWorkspaceRoot(),
+      planFileName: 'current_plan.json',
+      autoSave: true,
+      maxAge: 24 * 60 * 60 * 1000, // 24小时
+    });
+
+    // 初始化对话上下文管理器
+    const conversationConfig: ConversationConfig = {
+      maxContextMessages: 20,
+      maxTokenLimit: 8000,
+      relevanceThreshold: 0.6,
+      importanceThreshold: 0.7,
+      sessionTimeoutMs: 30 * 60 * 1000, // 30分钟
+      summarizationThreshold: 50,
+    };
+    this.conversationContextManager = new ConversationContextManager(conversationConfig);
 
     // 设置多智能体系统
     if (options.multiAgentSystem) {
       this.multiAgentSystem = options.multiAgentSystem;
-
-      // 如果有多智能体系统，创建工具路由器
-      const mcpManager = this.multiAgentSystem.getMcpManager();
-      const agentManager = this.multiAgentSystem.getAgentManager();
-      const decisionEngine = this.multiAgentSystem.getDecisionEngine();
-
-      this.toolRouter = new ToolRouter(mcpManager, agentManager, decisionEngine, {
-        strategy: RoutingStrategy.HYBRID, // 使用混合策略
-        mcpPriority: 0.6, // MCP优先级
-        a2aPriority: 0.4, // A2A优先级
-        timeout: 30000, // 超时时间
-        retryCount: 2, // 重试次数
-        fallbackEnabled: true, // 启用回退机制
-      });
+      this.setupToolRouter();
     }
+  }
 
-    // 初始化任务状态
-    this._taskState = {
-      isTaskActive: false,
-      taskContext: new Map<string, any>(),
-      lastActiveTime: Date.now(),
-      completedSteps: [],
-      currentStepIndex: 0,
-    };
+  /**
+   * 设置工具路由器
+   */
+  private setupToolRouter(): void {
+    if (!this.multiAgentSystem) return;
+
+    const mcpManager = this.multiAgentSystem.getMcpManager();
+    const agentManager = this.multiAgentSystem.getAgentManager();
+    const decisionEngine = this.multiAgentSystem.getDecisionEngine();
+
+    this.toolRouter = new ToolRouter(mcpManager, agentManager, decisionEngine, {
+      strategy: RoutingStrategy.HYBRID,
+      mcpPriority: 0.6,
+      a2aPriority: 0.4,
+      timeout: 30000,
+      retryCount: 3,
+      fallbackEnabled: true,
+    });
   }
 
   /**
@@ -139,113 +936,12 @@ export class Manus extends ToolCallAgent {
       llmConfigName?: string;
       tools?: ToolCollection;
       useMcpServer?: boolean;
-      continueTask?: boolean; // 新增参数，决定是否继续任务
+      continueTask?: boolean;
       multiAgentSystem?: MultiAgentSystem;
-      enableMultiAgent?: boolean; // 是否启用多智能体系统
+      enableMultiAgent?: boolean;
     } = {}
   ): Promise<Manus> {
-    let multiAgentSystem = options.multiAgentSystem;
-
-    // 在多智能体系统初始化之前，先检查和处理 .manus 目录
-    const logger = new Logger('Manus');
-    const workspaceRoot = config.getWorkspaceRoot();
-    const manusDir = path.join(workspaceRoot, '.manus');
-
-    // 处理 .manus 目录
-    if (fs.existsSync(manusDir)) {
-      // 检查是否处于继续任务状态
-      const isContinuingTask = options.continueTask;
-
-      if (!isContinuingTask) {
-        // 如果不是继续任务，则备份目录
-        const backupDir = path.join(workspaceRoot, `.manus_backup_${Date.now()}`);
-        logger.info(`发现现有.manus目录，正在备份到 ${backupDir}`);
-        fs.cpSync(manusDir, backupDir, { recursive: true });
-
-        // 清空原目录
-        fs.rmSync(manusDir, { recursive: true, force: true });
-        fs.mkdirSync(manusDir, { recursive: true });
-      } else {
-        logger.info('继续执行任务，保留现有.manus目录');
-      }
-    } else {
-      // 创建.manus目录
-      fs.mkdirSync(manusDir, { recursive: true });
-    }
-
-    // .manus 目录处理完成，现在可以安全地进行后续初始化
-
-    // 如果启用多智能体系统且未提供实例，尝试创建
-    if (options.enableMultiAgent && !multiAgentSystem) {
-      try {
-        logger.info('正在从配置文件初始化多智能体系统...');
-
-        // 从配置文件读取MCP服务器和A2A代理配置
-        const mcpServersConfig = config.getMcpServersConfig();
-        const agentsConfig = config.getAgentsConfig();
-
-        if (mcpServersConfig.length > 0 || agentsConfig.length > 0) {
-          // 创建多智能体系统配置
-          const multiAgentConfig = {
-            mcp_services: mcpServersConfig,
-            a2a_agents: agentsConfig,
-            routing_rules: [],
-            memory_config: {
-              provider: 'local' as const,
-              local: {
-                storage_path: './.manus/memory',
-                max_file_size: 10485760,
-              },
-            },
-            task_management: {
-              max_concurrent_tasks: 5,
-              task_timeout: 300000,
-              priority_queue_size: 100,
-              interruption_policy: 'at_checkpoint' as const,
-              checkpoint_interval: 30000,
-              task_persistence: true,
-              auto_recovery: true,
-            },
-            decision_engine: {
-              strategy: 'hybrid' as const,
-              fallback_strategy: 'local' as const,
-              confidence_threshold: 0.7,
-              learning_enabled: false,
-              metrics_collection: true,
-            },
-            system: {
-              name: 'Manus-MultiAgent',
-              version: '2.0.0',
-              debug_mode: false,
-              log_level: 'info' as const,
-            },
-          };
-
-          // 创建多智能体系统
-          multiAgentSystem = new MultiAgentSystem(multiAgentConfig);
-
-          // 启动多智能体系统
-          await multiAgentSystem.start();
-
-          logger.info(
-            `多智能体系统启动成功: ${mcpServersConfig.length} 个MCP服务, ${agentsConfig.length} 个代理`
-          );
-        } else {
-          logger.info('配置文件中未找到MCP服务器或代理配置，将使用传统模式运行');
-          multiAgentSystem = undefined;
-        }
-      } catch (error) {
-        logger.error(`初始化多智能体系统失败: ${error}`);
-        logger.info('将使用传统模式运行');
-        multiAgentSystem = undefined;
-      }
-    }
-
-    const instance = new Manus({
-      ...options,
-      multiAgentSystem,
-    });
-
+    const instance = new Manus(options);
     await instance.initialize(options.useMcpServer, options.continueTask);
     return instance;
   }
@@ -257,627 +953,501 @@ export class Manus extends ToolCallAgent {
     useMcpServer: boolean = false,
     continueTask: boolean = false
   ): Promise<void> {
-    // 尝试恢复任务状态（如果需要）
+    // 如果不是继续任务模式，先备份现有的.manus目录
+    if (!continueTask) {
+      this.taskManager.backupIfNeeded();
+      this.logger.info('非继续任务模式，已自动备份现有.manus目录');
+    }
+
+    // 尝试加载或恢复任务
     if (continueTask) {
-      this.loadTaskState();
+      const recentTask = this.taskManager.getRecentTask();
+      if (recentTask) {
+        this.taskManager.loadTask(recentTask.id);
+        this.logger.info(`恢复任务: ${recentTask.title}`);
+      }
     }
 
-    // MCP 服务器连接现在通过 MultiMcpManager 管理，不再在这里直接连接
-    // 避免 StdioClientTransport 导致的日志解析问题
-    if (useMcpServer) {
-      this.logger.info('MCP 服务器连接将通过 MultiMcpManager 管理');
+    // 尝试加载现有计划
+    const existingPlan = await this.planManager.loadPlan();
+    if (existingPlan && existingPlan.isActive) {
+      this.logger.info(`加载现有计划: ${existingPlan.title} (${existingPlan.steps.length} 步骤)`);
     }
-
-    // 启动定期保存任务状态的功能
-    // this.scheduleTaskStateSaving();
 
     this._initialized = true;
     this.logger.info('Manus 代理已初始化');
   }
 
   /**
-   * 思考过程
-   * 处理当前状态并决定下一步行动，添加适当的上下文
-   * 支持任务连续性，能够在中断后恢复执行任务
+   * 创建新任务
    */
-  async think(): Promise<boolean> {
-    // 确保已初始化
-    if (!this._initialized) {
-      await this.initialize();
+  createTask(title: string, description: string, steps: string[]): string {
+    const taskSteps: Omit<TaskStep, 'id'>[] = steps.map((step, index) => ({
+      title: `步骤 ${index + 1}`,
+      description: step,
+      status: StepStatus.PENDING,
+      retryCount: 0,
+      maxRetries: 3,
+      dependencies: index > 0 ? [`task_step_${index - 1}`] : [],
+    }));
+
+    const task = this.taskManager.createTask(title, description, taskSteps);
+    this.logger.info(`新任务已创建: ${title} (ID: ${task.id})`);
+    return task.id;
+  }
+
+  /**
+   * 继续任务执行
+   */
+  continueTask(taskId?: string): boolean {
+    let task = this.taskManager.getCurrentTask();
+
+    if (!task && taskId) {
+      task = this.taskManager.loadTask(taskId) || undefined;
     }
 
-    // 更新任务状态
-    this.updateTaskState();
-
-    // 保存原始提示词
-    const originalPrompt = this.nextStepPrompt;
-
-    // 如果存在活跃任务，添加任务上下文到提示词
-    if (this._taskState.isTaskActive) {
-      const taskContext = this.formatTaskContext();
-      this.nextStepPrompt = `${taskContext}\n\n${originalPrompt}`;
-
-      // 如果有任务计划，优先执行当前步骤
-      const currentStep = this.getCurrentStep();
-      if (currentStep) {
-        this.nextStepPrompt = `${taskContext}\n\n当前需要执行的步骤: ${currentStep}\n\n${originalPrompt}`;
+    if (!task && !taskId) {
+      task = this.taskManager.getRecentTask() || undefined;
+      if (task) {
+        this.taskManager.loadTask(task.id);
       }
     }
 
-    // 获取最近的消息
-    const recentMessages = this.memory.messages.slice(-5);
-
-    // 检查是否有任务相关指令
-    const hasTaskInstruction = recentMessages.some((msg) => {
-      if (msg.role !== 'user' || !msg.content) return false;
-      const content = msg.content.toLowerCase();
-      return (
-        content.includes('继续任务') ||
-        content.includes('恢复任务') ||
-        content.includes('任务计划') ||
-        content.includes('下一步')
-      );
-    });
-
-    // 如果有任务相关指令，确保任务状态为活跃
-    if (hasTaskInstruction && !this._taskState.isTaskActive && this._taskState.currentTask) {
-      this._taskState.isTaskActive = true;
-      this.logger.info(`恢复执行任务: ${this._taskState.currentTask}`);
-    }
-
-    // 检查是否使用了浏览器工具
-    const browserInUse = recentMessages.some((msg) => {
-      if (!msg.tool_calls) return false;
-      return msg.tool_calls.some((tc) => tc.function.name === 'BrowserUse');
-    });
-
-    // 如果使用了浏览器，添加浏览器上下文
-    if (browserInUse && this.browserContextHelper) {
-      // 在实际实现中，这里会格式化浏览器上下文
-      const browserContext = await this.browserContextHelper.formatNextStepPrompt();
-      this.nextStepPrompt = `${this.nextStepPrompt}\n\n${browserContext}`;
-    }
-
-    // 调用父类的 think 方法
-    const result = await super.think();
-
-    // 任务执行后更新状态
-    this.updateTaskStateAfterThinking(result);
-
-    // 恢复原始提示词
-    this.nextStepPrompt = originalPrompt;
-
-    return result;
-  }
-
-  /**
-   * 更新任务状态
-   * 分析最近的消息，更新当前任务状态
-   */
-  private updateTaskState(): void {
-    // 初始化任务上下文（如果不存在）
-    if (!this._taskState.taskContext) {
-      this._taskState.taskContext = new Map<string, any>();
-    }
-
-    // 更新最后活动时间
-    this._taskState.lastActiveTime = Date.now();
-
-    // 获取最近的消息
-    const recentMessages = this.memory.messages.slice(-10);
-
-    // 检查是否有新任务指令
-    for (const msg of recentMessages) {
-      if (msg.role !== 'user' || !msg.content) continue;
-
-      const content = msg.content.toLowerCase();
-
-      // 检测任务终止指令
-      if (
-        content.includes('停止任务') ||
-        content.includes('终止任务') ||
-        content.includes('取消任务')
-      ) {
-        this._taskState.isTaskActive = false;
-        this._taskState.currentTask = undefined;
-        this._taskState.taskPlan = undefined;
-        this._taskState.currentStepIndex = undefined;
-        this.logger.info('任务已终止');
-        return;
-      }
-
-      // 检测新任务指令
-      if (content.includes('新任务') || (content.length > 15 && !this._taskState.currentTask)) {
-        // 可能是新任务，保存任务描述
-        this._taskState.currentTask = msg.content;
-        this._taskState.isTaskActive = true;
-        this._taskState.currentStepIndex = 0;
-        this._taskState.taskPlan = undefined; // 清空旧计划，等待生成新计划
-        this.logger.info(
-          `检测到新任务: ${msg.content.substring(0, 50)}${msg.content.length > 50 ? '...' : ''}`
-        );
-      }
-    }
-
-    // 从助手消息中提取任务计划（如果存在）
-    if (this._taskState.isTaskActive && !this._taskState.taskPlan) {
-      for (const msg of recentMessages.reverse()) {
-        // 从最新消息开始检查
-        if (msg.role !== 'assistant' || !msg.content) continue;
-
-        // 尝试从消息中提取任务计划
-        const planMatch = msg.content.match(/计划[：:](\s*\n*)((?:(?:\d+\.)[^\n]+\n*)+)/i);
-        if (planMatch && planMatch[2]) {
-          const planText = planMatch[2].trim();
-          const steps = planText
-            .split('\n')
-            .map((step) => step.replace(/^\d+\.\s*/, '').trim())
-            .filter((step) => step.length > 0);
-
-          if (steps.length > 0) {
-            this._taskState.taskPlan = steps;
-            this._taskState.currentStepIndex = 0;
-            this.logger.info(`提取到任务计划，共 ${steps.length} 步`);
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * 思考后更新任务状态
-   * @param thinkResult 思考结果
-   */
-  private updateTaskStateAfterThinking(thinkResult: boolean): void {
-    // 如果思考成功且任务处于活跃状态
-    if (thinkResult && this._taskState.isTaskActive) {
-      // 如果有任务计划，尝试推进到下一步
-      if (this._taskState.taskPlan && this._taskState.taskPlan.length > 0) {
-        const currentIndex = this._taskState.currentStepIndex || 0;
-
-        // 检查是否完成了当前步骤
-        const lastMessage = this.memory.messages[this.memory.messages.length - 1];
-        if (lastMessage && lastMessage.role === 'assistant' && lastMessage.content) {
-          const currentStep = this._taskState.taskPlan[currentIndex];
-          const stepCompleteIndicators = [
-            '完成了',
-            '已完成',
-            '已经完成',
-            '成功',
-            '完毕',
-            '下一步',
-            '接下来',
-            '继续',
-          ];
-
-          // 检查是否有完成当前步骤的指示
-          const hasCompletionIndicator = stepCompleteIndicators.some((indicator) =>
-            lastMessage.content!.includes(indicator)
-          );
-
-          if (hasCompletionIndicator && currentIndex < this._taskState.taskPlan.length - 1) {
-            // 推进到下一步
-            this._taskState.currentStepIndex = currentIndex + 1;
-            this.logger.info(
-              `任务进度更新: 步骤 ${currentIndex + 1}/${this._taskState.taskPlan.length} 完成`
-            );
-          }
-
-          // 检查任务是否全部完成
-          if (
-            (currentIndex === this._taskState.taskPlan.length - 1 &&
-              lastMessage.content.includes('任务完成')) ||
-            lastMessage.content.includes('全部完成')
-          ) {
-            this.logger.info('任务全部完成');
-            this._taskState.isTaskActive = false;
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * 格式化任务上下文信息
-   * 生成包含当前任务状态的提示信息
-   */
-  private formatTaskContext(): string {
-    if (!this._taskState.currentTask) {
-      return '';
-    }
-
-    let contextText = `当前正在执行的任务: ${this._taskState.currentTask}\n`;
-
-    // 添加任务计划信息
-    if (this._taskState.taskPlan && this._taskState.taskPlan.length > 0) {
-      contextText += '\n任务计划:\n';
-      this._taskState.taskPlan.forEach((step, index) => {
-        const currentIndex = this._taskState.currentStepIndex || 0;
-        const status = index < currentIndex ? '✓' : index === currentIndex ? '→' : ' ';
-        contextText += `${status} ${index + 1}. ${step}\n`;
-      });
-    }
-
-    // 添加关键上下文数据
-    if (this._taskState.taskContext && this._taskState.taskContext.size > 0) {
-      contextText += '\n任务上下文:\n';
-      this._taskState.taskContext.forEach((value, key) => {
-        // 对于复杂对象，只显示摘要信息
-        const valueStr =
-          typeof value === 'object'
-            ? JSON.stringify(value).substring(0, 50) + '...'
-            : String(value);
-        contextText += `- ${key}: ${valueStr}\n`;
-      });
-    }
-
-    return contextText;
-  }
-
-  /**
-   * 设置任务上下文数据
-   * @param key 上下文数据键
-   * @param value 上下文数据值
-   */
-  public setTaskContextData(key: string, value: any): void {
-    if (!this._taskState.taskContext) {
-      this._taskState.taskContext = new Map<string, any>();
-    }
-    this._taskState.taskContext.set(key, value);
-  }
-
-  /**
-   * 获取任务上下文数据
-   * @param key 上下文数据键
-   * @returns 上下文数据值
-   */
-  public getTaskContextData(key: string): any {
-    return this._taskState.taskContext?.get(key);
-  }
-
-  /**
-   * 设置任务计划
-   */
-  public setTaskPlan(taskPlan: string[], originalDescription?: string, sourceFile?: string): void {
-    this._taskState.taskPlan = [...taskPlan];
-    this._taskState.currentStepIndex = 0;
-    this._taskState.completedSteps = [];
-    this._taskState.isTaskActive = true;
-    this._taskState.taskStartTime = Date.now();
-    this._taskState.lastActiveTime = Date.now();
-
-    if (originalDescription) {
-      this._taskState.originalTaskDescription = originalDescription;
-    }
-
-    if (sourceFile) {
-      this._taskState.taskSourceFile = sourceFile;
-    }
-
-    this.logger.info(`任务计划已设置，共 ${taskPlan.length} 个步骤`);
-    this.saveTaskState();
-  }
-
-  /**
-   * 获取当前任务计划
-   */
-  public getTaskPlan(): string[] {
-    return this._taskState.taskPlan || [];
-  }
-
-  /**
-   * 获取当前步骤
-   */
-  public getCurrentStep(): string | null {
-    if (!this._taskState.taskPlan || this._taskState.currentStepIndex === undefined) {
-      return null;
-    }
-
-    if (this._taskState.currentStepIndex < this._taskState.taskPlan.length) {
-      return this._taskState.taskPlan[this._taskState.currentStepIndex];
-    }
-
-    return null;
-  }
-
-  /**
-   * 标记当前步骤为完成
-   */
-  public markCurrentStepCompleted(): void {
-    if (!this._taskState.taskPlan || this._taskState.currentStepIndex === undefined) {
-      return;
-    }
-
-    const currentStep = this.getCurrentStep();
-    if (currentStep) {
-      this._taskState.completedSteps = this._taskState.completedSteps || [];
-      this._taskState.completedSteps.push(currentStep);
-      this._taskState.currentStepIndex++;
-      this._taskState.lastActiveTime = Date.now();
-
-      this.logger.info(`步骤已完成: ${currentStep}`);
-      this.logger.info(
-        `进度: ${this._taskState.currentStepIndex}/${this._taskState.taskPlan.length}`
-      );
-
-      // 检查是否所有步骤都已完成
-      if (this._taskState.currentStepIndex >= this._taskState.taskPlan.length) {
-        this._taskState.isTaskActive = false;
-        this.logger.info('所有任务步骤已完成！');
-      }
-
-      this.saveTaskState();
-    }
-  }
-
-  /**
-   * 获取任务进度信息
-   */
-  public getTaskProgress(): {
-    isActive: boolean;
-    totalSteps: number;
-    completedSteps: number;
-    currentStep: string | null;
-    progress: number;
-    completedStepsList: string[];
-  } {
-    const taskPlan = this._taskState.taskPlan || [];
-    const completedSteps = this._taskState.completedSteps || [];
-    const currentStepIndex = this._taskState.currentStepIndex || 0;
-
-    return {
-      isActive: this._taskState.isTaskActive || false,
-      totalSteps: taskPlan.length,
-      completedSteps: completedSteps.length,
-      currentStep: this.getCurrentStep(),
-      progress: taskPlan.length > 0 ? (completedSteps.length / taskPlan.length) * 100 : 0,
-      completedStepsList: [...completedSteps],
-    };
-  }
-
-  /**
-   * 从已保存的任务计划继续执行
-   */
-  public continueTaskExecution(): boolean {
-    if (!this._taskState.isTaskActive || !this._taskState.taskPlan) {
-      this.logger.warn('没有可继续的任务');
+    if (!task) {
+      this.logger.warn('没有找到可继续的任务');
       return false;
     }
 
-    const progress = this.getTaskProgress();
-    if (progress.totalSteps === progress.completedSteps) {
-      this.logger.info('任务已全部完成');
+    if (task.status === TaskStatus.COMPLETED) {
+      this.logger.info('任务已完成，无需继续');
       return false;
     }
 
-    this.logger.info(`继续执行任务，当前进度: ${progress.completedSteps}/${progress.totalSteps}`);
-    this.logger.info(`下一步: ${progress.currentStep}`);
+    if (task.status === TaskStatus.PAUSED) {
+      this.taskManager.resumeTask();
+    } else if (task.status === TaskStatus.PENDING) {
+      this.taskManager.startTask();
+    }
 
+    this.logger.info(`继续执行任务: ${task.title}`);
     return true;
   }
 
   /**
-   * 保存任务状态到文件
-   * 将当前任务状态持久化到.manus目录
+   * 继续任务执行（别名方法，用于main.ts调用）
    */
-  private saveTaskState(): void {
+  continueTaskExecution(): boolean {
+    return this.continueTask();
+  }
+
+  /**
+   * 暂停当前任务
+   */
+  pauseTask(): boolean {
+    const currentTask = this.taskManager.getCurrentTask();
+    if (!currentTask) {
+      this.logger.warn('没有活跃任务可暂停');
+      return false;
+    }
+
+    const success = this.taskManager.pauseTask();
+    if (success) {
+      this.logger.info(`任务已暂停: ${currentTask.title}`);
+    }
+    return success;
+  }
+
+  /**
+   * 思考过程 - 重构版本
+   */
+  async think(): Promise<boolean> {
+    if (!this._initialized) {
+      await this.initialize();
+    }
+
+    // 记录用户消息到对话上下文
+    await this.recordConversationContext();
+
+    // 检查当前任务状态
+    const currentTask = this.taskManager.getCurrentTask();
+    if (!currentTask) {
+      // 没有任务时使用原有逻辑
+      const result = await super.think();
+
+      // 记录助手响应到对话上下文
+      await this.recordAssistantResponse();
+
+      return result;
+    }
+
+    // 构建包含对话上下文的任务感知提示词
+    const originalPrompt = this.nextStepPrompt;
+    this.nextStepPrompt = await this.buildTaskAwarePromptWithContext(currentTask);
+
     try {
-      // 如果没有活跃任务，不需要保存
-      if (
-        !this._taskState.isTaskActive ||
-        (!this._taskState.currentTask && !this._taskState.taskPlan)
-      ) {
-        return;
+      // 开始或继续当前步骤
+      const currentStep = this.taskManager.getCurrentStep();
+      if (currentStep && currentStep.status === StepStatus.PENDING) {
+        this.taskManager.startCurrentStep();
       }
 
-      const workspaceRoot = config.getWorkspaceRoot();
-      const taskStateFile = path.join(workspaceRoot, '.manus', 'task_state.json');
+      // 执行思考过程
+      const result = await super.think();
 
-      // 将Map转换为普通对象以便序列化
-      const taskContextObj: Record<string, any> = {};
-      this._taskState.taskContext?.forEach((value, key) => {
-        // 对于复杂对象，尝试序列化
-        if (typeof value === 'object') {
-          try {
-            taskContextObj[key] = JSON.stringify(value);
-          } catch (e) {
-            taskContextObj[key] = String(value);
-          }
+      // 记录助手响应到对话上下文
+      await this.recordAssistantResponse();
+
+      // 处理执行结果
+      if (result && currentStep) {
+        this.taskManager.completeCurrentStep();
+        this.executionStats.successfulSteps++;
+      } else if (currentStep) {
+        const shouldRetry = this.taskManager.failCurrentStep('步骤执行失败');
+        if (shouldRetry) {
+          this.executionStats.retriedSteps++;
         } else {
-          taskContextObj[key] = value;
+          this.executionStats.failedSteps++;
         }
-      });
+      }
 
-      // 准备要保存的状态数据
-      const stateToSave = {
-        currentTask: this._taskState.currentTask,
-        originalTaskDescription: this._taskState.originalTaskDescription,
-        taskPlan: this._taskState.taskPlan,
-        currentStepIndex: this._taskState.currentStepIndex,
-        completedSteps: this._taskState.completedSteps,
-        taskContext: taskContextObj,
-        lastActiveTime: Date.now(),
-        isTaskActive: this._taskState.isTaskActive,
-        taskStartTime: this._taskState.taskStartTime,
-        taskSourceFile: this._taskState.taskSourceFile,
-      };
+      this.executionStats.totalSteps++;
+      this.updateExecutionStats();
 
-      // 写入文件
-      fs.writeFileSync(taskStateFile, JSON.stringify(stateToSave, null, 2));
-      this.logger.info('任务状态已保存');
+      return result;
     } catch (error) {
-      this.logger.error(`保存任务状态失败: ${(error as Error).message}`);
+      this.logger.error(`思考过程出错: ${(error as Error).message}`);
+
+      const currentStep = this.taskManager.getCurrentStep();
+      if (currentStep) {
+        this.taskManager.failCurrentStep((error as Error).message);
+        this.executionStats.failedSteps++;
+      }
+
+      return false;
+    } finally {
+      // 恢复原始提示词
+      this.nextStepPrompt = originalPrompt;
     }
   }
 
   /**
-   * 从文件加载任务状态
-   * 从.manus目录恢复之前保存的任务状态
+   * 构建任务感知的提示词
    */
-  private loadTaskState(): void {
-    try {
-      const workspaceRoot = config.getWorkspaceRoot();
-      const taskStateFile = path.join(workspaceRoot, '.manus', 'task_state.json');
+  private buildTaskAwarePrompt(task: TaskPersistence): string {
+    const currentStep = this.taskManager.getCurrentStep();
+    const progress = task.metadata.progress.toFixed(1);
 
-      // 检查文件是否存在
-      if (!fs.existsSync(taskStateFile)) {
-        return;
+    let prompt = `当前任务: ${task.title}\n`;
+    prompt += `任务描述: ${task.description}\n`;
+    prompt += `任务状态: ${task.status}\n`;
+    prompt += `执行进度: ${progress}% (${task.metadata.completedSteps}/${task.metadata.totalSteps})\n`;
+
+    if (currentStep) {
+      prompt += `\n当前步骤: ${currentStep.title}\n`;
+      prompt += `步骤描述: ${currentStep.description}\n`;
+      prompt += `步骤状态: ${currentStep.status}\n`;
+
+      if (currentStep.retryCount > 0) {
+        prompt += `重试次数: ${currentStep.retryCount}/${currentStep.maxRetries}\n`;
+      }
+    }
+
+    // 添加最近的检查点信息
+    const recentCheckpoints = task.checkpoints.slice(-2);
+    if (recentCheckpoints.length > 0) {
+      prompt += `\n最近检查点:\n`;
+      recentCheckpoints.forEach((checkpoint) => {
+        prompt += `- ${new Date(checkpoint.timestamp).toLocaleString()}: ${checkpoint.description}\n`;
+      });
+    }
+
+    prompt += `\n${NEXT_STEP_PROMPT}`;
+    return prompt;
+  }
+
+  /**
+   * 构建包含对话上下文的任务感知提示词
+   */
+  private async buildTaskAwarePromptWithContext(task: TaskPersistence): Promise<string> {
+    // 获取基础的任务感知提示词
+    let prompt = this.buildTaskAwarePrompt(task);
+
+    // 添加计划信息（如果存在）
+    const currentPlan = this.planManager.getCurrentPlan();
+    if (currentPlan && currentPlan.isActive) {
+      const planProgress = this.planManager.getProgress();
+      const currentPlanStep = this.planManager.getCurrentStep();
+
+      prompt += `\n当前计划: ${currentPlan.title}\n`;
+      if (currentPlan.description) {
+        prompt += `计划描述: ${currentPlan.description}\n`;
+      }
+      prompt += `计划进度: ${planProgress.completedSteps}/${planProgress.totalSteps} (${planProgress.progress.toFixed(1)}%)\n`;
+
+      if (currentPlanStep) {
+        prompt += `当前计划步骤: ${currentPlanStep.description}\n`;
+        prompt += `步骤状态: ${currentPlanStep.status}\n`;
+        if (currentPlanStep.notes) {
+          prompt += `步骤备注: ${currentPlanStep.notes}\n`;
+        }
       }
 
-      // 读取并解析状态文件
-      const stateData = JSON.parse(fs.readFileSync(taskStateFile, 'utf-8'));
-      this._taskState.currentTask = stateData.currentTask || '';
-
-      // 检查数据有效性和时间戳
-      const maxAgeMs = 24 * 60 * 60 * 1000; // 24小时
-      const now = Date.now();
-      if (
-        !stateData.currentTask ||
-        !stateData.isTaskActive ||
-        now - stateData.lastActiveTime > maxAgeMs
-      ) {
-        this.logger.info('找到过期的任务状态，忽略');
-        return;
-      }
-
-      // 恢复任务上下文Map
-      const taskContext = new Map<string, any>();
-      if (stateData.taskContext) {
-        Object.entries(stateData.taskContext).forEach(([key, value]) => {
-          // 尝试将字符串还原为对象
-          if (typeof value === 'string' && value.startsWith('{') && value.endsWith('}')) {
-            try {
-              taskContext.set(key, JSON.parse(value as string));
-            } catch (e) {
-              taskContext.set(key, value);
-            }
-          } else {
-            taskContext.set(key, value);
-          }
+      // 显示计划中的下几个步骤
+      const nextSteps = currentPlan.steps.slice(
+        planProgress.currentStepIndex + 1,
+        planProgress.currentStepIndex + 3
+      );
+      if (nextSteps.length > 0) {
+        prompt += `接下来的计划步骤:\n`;
+        nextSteps.forEach((step, index) => {
+          prompt += `${planProgress.currentStepIndex + index + 2}. ${step.description}\n`;
         });
       }
-
-      // 恢复任务状态
-      this._taskState = {
-        currentTask: stateData.currentTask,
-        originalTaskDescription: stateData.originalTaskDescription,
-        taskPlan: stateData.taskPlan,
-        currentStepIndex: stateData.currentStepIndex,
-        completedSteps: stateData.completedSteps || [],
-        taskContext,
-        lastActiveTime: stateData.lastActiveTime,
-        isTaskActive: stateData.isTaskActive,
-        taskStartTime: stateData.taskStartTime,
-        taskSourceFile: stateData.taskSourceFile,
-      };
-
-      this.logger.info(
-        `已恢复任务: ${stateData.currentTask.substring(0, 50)}${stateData.currentTask.length > 50 ? '...' : ''}`
-      );
-    } catch (error) {
-      this.logger.error(`加载任务状态失败: ${(error as Error).message}`);
     }
-  }
 
-  /**
-   * 定期保存任务状态
-   * 在任务执行过程中定期保存状态，防止意外中断导致任务丢失
-   */
-  private scheduleTaskStateSaving(): void {
-    // 每10秒保存一次任务状态
-    const saveInterval = 10 * 1000;
+    try {
+      // 获取相关的对话上下文
+      const currentQuery = this.extractCurrentQuery();
+      const relevantContext = await this.conversationContextManager.getRelevantContext(
+        currentQuery,
+        10
+      );
 
-    const intervalId = setInterval(() => {
-      if (this._taskState.isTaskActive) {
-        this.saveTaskState();
-      } else {
-        clearInterval(intervalId);
+      if (relevantContext.length > 0) {
+        prompt += `\n相关对话上下文:\n`;
+        relevantContext.forEach((msg, index) => {
+          const role = msg.role === 'user' ? '用户' : '助手';
+          const content = (msg.content || '').substring(0, 200);
+          prompt += `${index + 1}. [${role}] ${content}${(msg.content || '').length > 200 ? '...' : ''}\n`;
+        });
       }
-    }, saveInterval);
+    } catch (error) {
+      this.logger.warn(`获取对话上下文失败: ${(error as Error).message}`);
+    }
+
+    return prompt;
   }
 
   /**
-   * 执行工具调用
-   * 通过智能工具路由器自动选择MCP服务或A2A代理来执行工具
-   * @param commandOrName 工具调用命令或工具名称
-   * @param args 工具参数（当第一个参数为工具名称时使用）
+   * 记录对话上下文
    */
-  protected async executeToolCall(commandOrName: ToolCall | string, args?: any): Promise<any> {
-    // 如果有工具路由器，使用智能路由
-    if (this.toolRouter) {
-      try {
-        // 获取工具名称和参数
-        let toolName: string;
-        let toolArgs: any;
+  private async recordConversationContext(): Promise<void> {
+    try {
+      // 获取最近的用户消息
+      const recentMessages = this.memory.messages.slice(-5);
+      const userMessages = recentMessages.filter((msg) => msg.role === 'user');
 
-        if (typeof commandOrName === 'string') {
-          toolName = commandOrName;
-          toolArgs = args || {};
-        } else {
-          const command = commandOrName;
-          if (!command || !command.function || !command.function.name) {
-            return '错误: 无效的命令格式';
-          }
-
-          toolName = command.function.name;
-          try {
-            toolArgs = JSON.parse(command.function.arguments || '{}');
-          } catch (error) {
-            return `错误: 无法解析工具参数 - ${error}`;
-          }
-        }
-
-        this.logger.info(`通过智能路由器调用工具: ${toolName}`);
-
-        // 构建工具调用请求
-        const toolRequest = {
-          name: toolName,
-          arguments: toolArgs,
-          context: {
-            task: this._taskState.currentTask
-              ? this._taskState.currentTask.substring(0, 200)
-              : 'default_task',
-            step: this._taskState.currentStepIndex ?? -1,
-          },
+      for (const userMsg of userMessages) {
+        const message: Message = {
+          role: 'user' as Role,
+          content: userMsg.content || '',
         };
 
-        // 通过工具路由器执行
-        const routerResult = await this.toolRouter.executeToolCall(toolRequest);
+        // 检查是否为任务创建或重要消息
+        const metadata = this.extractMessageMetadata(message);
 
-        if (!routerResult.success) {
-          throw new Error(routerResult.error || '工具执行失败');
-        }
+        await this.conversationContextManager.addMessage(message, metadata);
+      }
+    } catch (error) {
+      this.logger.warn(`记录用户消息上下文失败: ${(error as Error).message}`);
+    }
+  }
 
-        // 如果是直接调用（通过工具名称和参数），返回处理后的结果
-        if (typeof commandOrName === 'string') {
-          return {
-            output: this.formatToolResult(routerResult.result),
-            error: null,
-            executedBy: routerResult.executedBy,
-            executionTime: routerResult.executionTime,
-          };
-        }
+  /**
+   * 提取消息元数据，用于确定消息的重要性和保护级别
+   */
+  private extractMessageMetadata(message: Message): Record<string, any> {
+    const content = message.content?.toLowerCase() || '';
+    const currentTask = this.taskManager.getCurrentTask();
 
-        // 如果是通过 ToolCall 对象调用，返回格式化的观察结果
-        return `观察到执行的命令 \`${toolName}\` 的输出 (由 ${routerResult.executedBy} 执行):\n${this.formatToolResult(routerResult.result)}`;
-      } catch (error) {
-        this.logger.error(`智能路由工具调用失败: ${(error as Error).message}`);
+    const metadata: Record<string, any> = {
+      taskId: currentTask?.id,
+      source: 'manus_agent',
+      timestamp: Date.now(),
+    };
 
-        // 如果是直接调用（通过工具名称和参数），返回错误结果
-        if (typeof commandOrName === 'string') {
-          return {
-            output: null,
-            error: (error as Error).message,
-          };
-        }
+    // 检查是否为任务创建消息
+    if (
+      content.includes('创建任务') ||
+      content.includes('新任务') ||
+      content.includes('开始任务') ||
+      content.includes('第一个任务') ||
+      content.includes('首次任务') ||
+      content.includes('初始任务')
+    ) {
+      metadata.isTaskCreation = true;
+      metadata.isProtected = true;
 
-        // 如果是通过 ToolCall 对象调用，返回错误消息
-        return `执行工具时出错: ${(error as Error).message}`;
+      // 如果是第一个任务，标记为首次任务
+      if (!currentTask) {
+        metadata.isFirstTask = true;
       }
     }
 
-    // 回退到父类的工具调用方法（保持向后兼容）
-    return super.executeToolCall(commandOrName, args);
+    // 检查是否为长消息（可能包含重要信息）
+    if ((message.content?.length || 0) > 200) {
+      metadata.isLongMessage = true;
+      metadata.isProtected = true;
+    }
+
+    // 检查是否包含重要关键词
+    if (
+      content.includes('重要') ||
+      content.includes('关键') ||
+      content.includes('必须') ||
+      content.includes('一定要') ||
+      content.includes('注意')
+    ) {
+      metadata.hasImportantKeywords = true;
+      metadata.isProtected = true;
+    }
+
+    return metadata;
+  }
+
+  /**
+   * 记录助手响应到对话上下文
+   */
+  private async recordAssistantResponse(): Promise<void> {
+    try {
+      // 获取最近的助手消息
+      const recentMessages = this.memory.messages.slice(-3);
+      const assistantMessages = recentMessages.filter((msg) => msg.role === 'assistant');
+
+      for (const assistantMsg of assistantMessages) {
+        const message: Message = {
+          role: 'assistant' as Role,
+          content: assistantMsg.content || '',
+        };
+
+        await this.conversationContextManager.addMessage(message, {
+          taskId: this.taskManager.getCurrentTask()?.id,
+          source: 'manus_agent',
+          timestamp: Date.now(),
+        });
+      }
+    } catch (error) {
+      this.logger.warn(`记录助手响应上下文失败: ${(error as Error).message}`);
+    }
+  }
+
+  /**
+   * 更新执行统计
+   */
+  private updateExecutionStats(): void {
+    const { totalSteps, successfulSteps } = this.executionStats;
+    if (totalSteps > 0) {
+      this.executionStats.averageStepDuration =
+        totalSteps > 0 ? (successfulSteps / totalSteps) * 100 : 0;
+    }
+  }
+
+  /**
+   * 执行工具调用 - 重构版本
+   */
+  protected async executeToolCall(commandOrName: ToolCall | string, args?: any): Promise<any> {
+    const startTime = Date.now();
+
+    try {
+      let result: any;
+
+      if (this.toolRouter) {
+        result = await this.executeToolCallWithRouter(commandOrName, args);
+      } else {
+        result = await super.executeToolCall(commandOrName, args);
+      }
+
+      // 记录成功的工具调用
+      const duration = Date.now() - startTime;
+      this.recordToolExecution(commandOrName, true, duration);
+
+      return result;
+    } catch (error) {
+      // 记录失败的工具调用
+      const duration = Date.now() - startTime;
+      this.recordToolExecution(commandOrName, false, duration, (error as Error).message);
+
+      throw error;
+    }
+  }
+
+  /**
+   * 通过路由器执行工具调用
+   */
+  private async executeToolCallWithRouter(
+    commandOrName: ToolCall | string,
+    args?: any
+  ): Promise<any> {
+    let toolName: string;
+    let toolArgs: any;
+
+    if (typeof commandOrName === 'string') {
+      toolName = commandOrName;
+      toolArgs = args || {};
+    } else {
+      toolName = commandOrName.function.name;
+      try {
+        toolArgs = JSON.parse(commandOrName.function.arguments || '{}');
+      } catch (error) {
+        throw new Error(`无法解析工具参数: ${error}`);
+      }
+    }
+
+    const currentTask = this.taskManager.getCurrentTask();
+    const toolRequest = {
+      name: toolName,
+      arguments: toolArgs,
+      context: {
+        task: currentTask?.title || 'default_task',
+        step: currentTask?.currentStepIndex ?? -1,
+      },
+    };
+
+    const routerResult = await this.toolRouter!.executeToolCall(toolRequest);
+
+    if (!routerResult.success) {
+      throw new Error(routerResult.error || '工具执行失败');
+    }
+
+    // 记录工具执行结果到任务上下文
+    if (currentTask) {
+      this.taskManager.setTaskContext(`tool_${toolName}_result`, routerResult.result);
+    }
+
+    if (typeof commandOrName === 'string') {
+      return {
+        output: this.formatToolResult(routerResult.result),
+        error: null,
+        executedBy: routerResult.executedBy,
+        executionTime: routerResult.executionTime,
+      };
+    }
+
+    return `工具 \`${toolName}\` 执行完成 (由 ${routerResult.executedBy} 执行):\n${this.formatToolResult(routerResult.result)}`;
+  }
+
+  /**
+   * 记录工具执行
+   */
+  private recordToolExecution(
+    commandOrName: ToolCall | string,
+    success: boolean,
+    duration: number,
+    error?: string
+  ): void {
+    const toolName =
+      typeof commandOrName === 'string' ? commandOrName : commandOrName.function.name;
+
+    const currentTask = this.taskManager.getCurrentTask();
+    if (currentTask) {
+      this.taskManager.setTaskContext(`last_tool_execution`, {
+        toolName,
+        success,
+        duration,
+        error,
+        timestamp: Date.now(),
+      });
+    }
   }
 
   /**
@@ -889,12 +1459,10 @@ export class Manus extends ToolCallAgent {
     }
 
     if (result && typeof result === 'object') {
-      // 如果是MCP结果格式
       if (result.content && Array.isArray(result.content)) {
         return result.content.map((item: any) => item.text || JSON.stringify(item)).join('\n');
       }
 
-      // 如果是A2A结果格式
       if (result.result !== undefined) {
         return typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
       }
@@ -906,15 +1474,421 @@ export class Manus extends ToolCallAgent {
   }
 
   /**
+   * 获取任务状态
+   */
+  getTaskStatus(): any {
+    const currentTask = this.taskManager.getCurrentTask();
+    if (!currentTask) {
+      return {
+        hasTask: false,
+        message: '当前没有活跃任务',
+      };
+    }
+
+    return {
+      hasTask: true,
+      task: {
+        id: currentTask.id,
+        title: currentTask.title,
+        description: currentTask.description,
+        status: currentTask.status,
+        progress: currentTask.metadata.progress,
+        totalSteps: currentTask.metadata.totalSteps,
+        completedSteps: currentTask.metadata.completedSteps,
+        failedSteps: currentTask.metadata.failedSteps,
+        currentStep: this.taskManager.getCurrentStep(),
+        createdAt: new Date(currentTask.createdAt).toLocaleString(),
+        updatedAt: new Date(currentTask.updatedAt).toLocaleString(),
+      },
+      executionStats: this.executionStats,
+    };
+  }
+
+  /**
+   * 获取任务进度（别名方法，用于main.ts调用，返回与getTaskStatus相同的格式）
+   */
+  getTaskProgress(): {
+    hasTask: boolean;
+    message?: string;
+    totalSteps: number;
+    completedSteps: number;
+    progress: number;
+    task?: {
+      id: string;
+      title: string;
+      description: string;
+      status: string;
+      progress: number;
+      totalSteps: number;
+      completedSteps: number;
+      failedSteps: number;
+      currentStep: any;
+      createdAt: string;
+      updatedAt: string;
+    };
+    executionStats?: any;
+  } {
+    const currentTask = this.taskManager.getCurrentTask();
+    if (!currentTask) {
+      return {
+        hasTask: false,
+        message: '当前没有活跃任务',
+        totalSteps: 0,
+        completedSteps: 0,
+        progress: 0,
+      };
+    }
+
+    return {
+      hasTask: true,
+      totalSteps: currentTask.metadata.totalSteps,
+      completedSteps: currentTask.metadata.completedSteps,
+      progress: currentTask.metadata.progress,
+      task: {
+        id: currentTask.id,
+        title: currentTask.title,
+        description: currentTask.description,
+        status: currentTask.status,
+        progress: currentTask.metadata.progress,
+        totalSteps: currentTask.metadata.totalSteps,
+        completedSteps: currentTask.metadata.completedSteps,
+        failedSteps: currentTask.metadata.failedSteps,
+        currentStep: this.taskManager.getCurrentStep(),
+        createdAt: new Date(currentTask.createdAt).toLocaleString(),
+        updatedAt: new Date(currentTask.updatedAt).toLocaleString(),
+      },
+      executionStats: this.executionStats,
+    };
+  }
+
+  /**
+   * 获取任务历史
+   */
+  getTaskHistory(limit: number = 10): any[] {
+    const currentTask = this.taskManager.getCurrentTask();
+    if (!currentTask) {
+      return [];
+    }
+
+    return currentTask.executionHistory.slice(-limit).map((event) => ({
+      timestamp: new Date(event.timestamp).toLocaleString(),
+      type: event.type,
+      description: event.description,
+      stepId: event.stepId,
+    }));
+  }
+
+  /**
+   * 获取历史任务记录
+   */
+  getHistoricalTasks(limit: number = 10): any[] {
+    const history = this.taskManager.getTaskHistory(limit);
+    return history.map((task) => ({
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      status: task.status,
+      progress: task.metadata.progress,
+      createdAt: new Date(task.createdAt).toLocaleString(),
+      updatedAt: new Date(task.updatedAt).toLocaleString(),
+      endTime: task.endTime ? new Date(task.endTime).toLocaleString() : null,
+      totalSteps: task.metadata.totalSteps,
+      completedSteps: task.metadata.completedSteps,
+      failedSteps: task.metadata.failedSteps,
+    }));
+  }
+
+  /**
+   * 获取对话上下文统计信息
+   */
+  getConversationStats(): any {
+    return this.conversationContextManager.getDetailedSessionStats();
+  }
+
+  /**
+   * 获取相关对话上下文
+   */
+  async getRelevantConversationContext(
+    query: string,
+    maxMessages: number = 10
+  ): Promise<Message[]> {
+    try {
+      return await this.conversationContextManager.getRelevantContext(query, maxMessages);
+    } catch (error) {
+      this.logger.error(`获取相关对话上下文失败: ${(error as Error).message}`);
+      return [];
+    }
+  }
+
+  /**
+   * 清除所有对话会话
+   */
+  clearConversationSessions(): void {
+    this.conversationContextManager.clearAllSessions();
+    this.logger.info('所有对话会话已清除');
+  }
+
+  /**
+   * 更新对话上下文配置
+   */
+  updateConversationConfig(config: Partial<ConversationConfig>): void {
+    this.conversationContextManager.updateConfig(config);
+    this.logger.info('对话上下文配置已更新');
+  }
+
+  /**
+   * 手动标记重要消息为保护状态
+   */
+  async markMessageAsProtected(
+    messageContent: string,
+    reason: string = '用户标记为重要'
+  ): Promise<void> {
+    try {
+      const message: Message = {
+        role: 'user' as Role,
+        content: messageContent,
+      };
+
+      await this.conversationContextManager.addMessage(message, {
+        isProtected: true,
+        isManuallyProtected: true,
+        protectionReason: reason,
+        taskId: this.taskManager.getCurrentTask()?.id,
+        source: 'user_manual_protection',
+        timestamp: Date.now(),
+      });
+
+      this.logger.info(`消息已标记为保护状态: ${reason}`);
+    } catch (error) {
+      this.logger.error('标记保护消息失败:', error);
+    }
+  }
+
+  // =================== 计划管理API ===================
+
+  /**
+   * 创建新计划
+   */
+  async createPlan(
+    title: string,
+    steps: string[],
+    options?: {
+      description?: string;
+      sourceFile?: string;
+      metadata?: Record<string, any>;
+    }
+  ): Promise<string> {
+    try {
+      const plan = await this.planManager.createPlan(title, steps, options);
+
+      // 标记计划创建消息为保护状态
+      await this.markMessageAsProtected(
+        `创建计划: ${title}，包含 ${steps.length} 个步骤`,
+        '计划创建消息'
+      );
+
+      this.logger.info(`新计划已创建: ${title} (ID: ${plan.id})`);
+      return plan.id;
+    } catch (error) {
+      this.logger.error('创建计划失败:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * 获取当前活跃计划
+   */
+  getCurrentPlan(): Plan | null {
+    return this.planManager.getCurrentPlan();
+  }
+
+  /**
+   * 获取当前计划步骤
+   */
+  getCurrentPlanStep(): PlanStep | null {
+    return this.planManager.getCurrentStep();
+  }
+
+  /**
+   * 标记当前计划步骤完成
+   */
+  async markPlanStepCompleted(notes?: string): Promise<boolean> {
+    try {
+      const success = await this.planManager.markStepCompleted(notes);
+      if (success) {
+        const currentStep = this.planManager.getCurrentStep();
+        if (currentStep) {
+          this.logger.info(`开始执行计划步骤: ${currentStep.description}`);
+        } else {
+          this.logger.info('所有计划步骤已完成！');
+        }
+      }
+      return success;
+    } catch (error) {
+      this.logger.error('标记计划步骤完成失败:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 设置计划步骤状态
+   */
+  async setPlanStepStatus(
+    stepIndex: number,
+    status: PlanStepStatus,
+    notes?: string
+  ): Promise<boolean> {
+    try {
+      return await this.planManager.setStepStatus(stepIndex, status, notes);
+    } catch (error) {
+      this.logger.error('设置计划步骤状态失败:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 获取计划进度信息
+   */
+  getPlanProgress(): {
+    isActive: boolean;
+    totalSteps: number;
+    completedSteps: number;
+    currentStepIndex: number;
+    currentStep: PlanStep | null;
+    progress: number;
+    remainingSteps: number;
+  } {
+    return this.planManager.getProgress();
+  }
+
+  /**
+   * 格式化计划显示
+   */
+  formatCurrentPlan(): string {
+    return this.planManager.formatPlan();
+  }
+
+  /**
+   * 清除当前计划
+   */
+  async clearPlan(): Promise<boolean> {
+    try {
+      return await this.planManager.clearPlan();
+    } catch (error) {
+      this.logger.error('清除计划失败:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 检查是否有活跃计划
+   */
+  hasActivePlan(): boolean {
+    return this.planManager.hasActivePlan();
+  }
+
+  /**
+   * 获取计划和任务的综合状态
+   */
+  getComprehensiveStatus(): {
+    task: any;
+    plan: {
+      isActive: boolean;
+      currentPlan: Plan | null;
+      progress: any;
+    };
+    conversation: any;
+  } {
+    const taskStatus = this.getTaskStatus();
+    const planProgress = this.getPlanProgress();
+    const conversationStats = this.getConversationStats();
+
+    return {
+      task: taskStatus,
+      plan: {
+        isActive: this.hasActivePlan(),
+        currentPlan: this.getCurrentPlan(),
+        progress: planProgress,
+      },
+      conversation: conversationStats,
+    };
+  }
+
+  /**
+   * 同步计划与任务
+   * 将计划步骤转换为任务步骤，或将任务步骤转换为计划
+   */
+  async syncPlanWithTask(): Promise<boolean> {
+    try {
+      const currentTask = this.taskManager.getCurrentTask();
+      const currentPlan = this.planManager.getCurrentPlan();
+
+      if (currentTask && !currentPlan) {
+        // 从任务创建计划
+        const steps = currentTask.steps.map((step) => step.description);
+        await this.createPlan(currentTask.title, steps, {
+          description: currentTask.description,
+          sourceFile: 'task_sync',
+          metadata: {
+            syncFromTaskId: currentTask.id,
+            syncTimestamp: Date.now(),
+          },
+        });
+        this.logger.info('从任务同步创建计划');
+        return true;
+      } else if (currentPlan && !currentTask) {
+        // 从计划创建任务
+        const steps = currentPlan.steps.map((step) => step.description);
+        const taskId = this.createTask(currentPlan.title, currentPlan.description || '', steps);
+        this.logger.info(`从计划同步创建任务: ${taskId}`);
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      this.logger.error('同步计划与任务失败:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 重写提取当前查询的方法
+   */
+  protected extractCurrentQuery(): string {
+    const currentTask = this.taskManager.getCurrentTask();
+    if (!currentTask) {
+      return super.extractCurrentQuery();
+    }
+
+    const currentStep = this.taskManager.getCurrentStep();
+    if (currentStep) {
+      return `执行任务"${currentTask.title}"的步骤: ${currentStep.description}`;
+    }
+
+    return `继续执行任务: ${currentTask.title}`;
+  }
+
+  /**
    * 清理资源
    */
   async cleanup(): Promise<void> {
-    // 保存当前任务状态
-    // this.saveTaskState();
+    // 暂停当前任务
+    this.taskManager.pauseTask();
 
-    // MCP 资源现在通过多智能体系统管理
+    // 保存当前计划（如果存在）
+    const currentPlan = this.planManager.getCurrentPlan();
+    if (currentPlan && currentPlan.isActive) {
+      await this.planManager.savePlan();
+      this.logger.info('当前计划已保存');
+    }
 
-    // 关闭 MCP 服务器进程
+    // 清理任务管理器
+    this.taskManager.cleanup();
+
+    // 清理对话上下文管理器
+    this.conversationContextManager.clearAllSessions();
+
+    // 清理MCP资源
     if (this.mcpServerProcess) {
       try {
         this.mcpServerProcess.kill();
@@ -924,12 +1898,11 @@ export class Manus extends ToolCallAgent {
       }
     }
 
-    // 清理浏览器资源
+    // 清理其他资源
     if (this.browserContextHelper) {
       // await this.browserContextHelper.cleanupBrowser();
     }
 
-    // 清理其他资源
     this._initialized = false;
     this.logger.info('Manus 代理资源已清理');
   }

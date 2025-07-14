@@ -103,8 +103,13 @@ export class LLM {
   private ensureValidMessages(messages: Message[]): Message[] {
     const hasNonSystemMessage = messages.some((msg) => msg.role !== Role.SYSTEM);
 
+    let validatedMessages = messages;
+
+    // 首先验证工具调用完整性，防止Claude API错误
+    validatedMessages = this.validateToolCallPairs(validatedMessages);
+
     if (hasNonSystemMessage) {
-      return messages;
+      return validatedMessages;
     }
 
     // 创建默认消息
@@ -114,7 +119,103 @@ export class LLM {
     });
 
     this.logger.warn('No non-system messages found, adding default user message');
-    return [...messages, defaultMessage];
+    return [...validatedMessages, defaultMessage];
+  }
+
+  /**
+   * 验证工具调用配对完整性 - LLM最终安全检查
+   * 确保发送给Claude的消息中每个toolUse都有对应的toolResult
+   */
+  private validateToolCallPairs(messages: Message[]): Message[] {
+    const result: Message[] = [];
+    const pendingToolCalls = new Map<string, Message>();
+    const processedToolResults = new Set<string>();
+
+    for (const message of messages) {
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        // 工具调用消息：记录待处理的工具调用
+        const validToolCalls = message.tool_calls.filter((call) => call.id && call.function?.name);
+
+        if (validToolCalls.length > 0) {
+          // 记录这些工具调用，等待匹配的结果
+          validToolCalls.forEach((call) => {
+            pendingToolCalls.set(call.id, message);
+          });
+
+          // 只保留有效的工具调用
+          if (validToolCalls.length === message.tool_calls.length) {
+            result.push(message);
+          } else {
+            result.push(new Message({
+              role: message.role,
+              content: message.content,
+              tool_calls: validToolCalls,
+            }));
+          }
+        } else {
+          // 没有有效的工具调用，只保留内容
+          if (message.content) {
+            result.push(new Message({
+              role: message.role,
+              content: message.content,
+            }));
+          }
+        }
+      } else if (message.tool_call_id) {
+        // 工具结果消息：检查是否有对应的工具调用
+        if (pendingToolCalls.has(message.tool_call_id) && !processedToolResults.has(message.tool_call_id)) {
+          result.push(message);
+          processedToolResults.add(message.tool_call_id);
+        } else {
+          this.logger.warn(`Removing orphaned or duplicate tool result: ${message.tool_call_id}`);
+        }
+      } else {
+        // 普通消息，直接添加
+        result.push(message);
+      }
+    }
+
+    // 检查是否有未配对的工具调用
+    const unpairedToolCalls = Array.from(pendingToolCalls.keys()).filter(
+      (id) => !processedToolResults.has(id)
+    );
+
+    if (unpairedToolCalls.length > 0) {
+      this.logger.warn(`Found ${unpairedToolCalls.length} unpaired tool calls, removing them`);
+
+      // 移除没有对应结果的工具调用消息
+      const finalResult: Message[] = [];
+      for (const message of result) {
+        if (message.tool_calls && message.tool_calls.length > 0) {
+          const pairedToolCalls = message.tool_calls.filter((call) =>
+            !unpairedToolCalls.includes(call.id)
+          );
+
+          if (pairedToolCalls.length > 0) {
+            finalResult.push(new Message({
+              role: message.role,
+              content: message.content,
+              tool_calls: pairedToolCalls,
+            }));
+          } else if (message.content) {
+            finalResult.push(new Message({
+              role: message.role,
+              content: message.content,
+            }));
+          }
+        } else {
+          finalResult.push(message);
+        }
+      }
+
+      return finalResult;
+    }
+
+    if (result.length !== messages.length) {
+      this.logger.debug(`Final tool call validation: ${messages.length} -> ${result.length} messages`);
+    }
+
+    return result;
   }
 
   /**

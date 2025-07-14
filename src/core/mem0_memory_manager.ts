@@ -345,7 +345,7 @@ export class Mem0MemoryManager {
   async getRelevantContext(currentQuery: string, allMessages: Message[]): Promise<Message[]> {
     if (!this.isEnabled()) {
       // 如果禁用记忆管理，返回最近的几条消息
-      return allMessages.slice(-this.config.maxContextMessages);
+      return allMessages;
     }
 
     try {

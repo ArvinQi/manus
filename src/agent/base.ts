@@ -157,39 +157,56 @@ export abstract class BaseAgent {
 
   /**
    * 验证工具调用完整性
-   * 移除没有配对结果的工具调用，防止API错误
+   * 确保工具调用和工具结果正确配对，防止API错误
    */
   private validateToolCallCompleteness(messages: Message[]): Message[] {
     const result: Message[] = [];
+    const validToolCallIds = new Set<string>();
     const processedToolResults = new Set<string>();
-    const processedToolCalls = new Set<string>();
 
+    // 第一遍：收集所有有效的工具调用ID
+    for (const message of messages) {
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        message.tool_calls.forEach((call) => {
+          validToolCallIds.add(call.id);
+        });
+      }
+    }
+
+    // 第二遍：构建结果，确保配对正确
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
 
+      // 处理工具结果消息
       if (message.tool_call_id) {
+        // 检查是否有对应的工具调用
+        if (!validToolCallIds.has(message.tool_call_id)) {
+          this.logger.warn(
+            `Removing orphaned tool result: ${message.tool_call_id} (no matching tool call)`
+          );
+          continue;
+        }
+
+        // 检查是否已经处理过
         if (processedToolResults.has(message.tool_call_id)) {
           this.logger.warn(`Removing duplicate tool result: ${message.tool_call_id}`);
           continue;
         }
+
         processedToolResults.add(message.tool_call_id);
         result.push(message);
         continue;
       }
 
+      // 处理工具调用消息
       if (message.tool_calls && message.tool_calls.length > 0) {
-        // Check for duplicate tool calls with same IDs
-        const uniqueToolCalls = message.tool_calls.filter((call) => {
-          if (processedToolCalls.has(call.id)) {
-            this.logger.warn(`Removing duplicate tool call: ${call.id}`);
-            return false;
-          }
-          processedToolCalls.add(call.id);
-          return true;
+        const validToolCalls = message.tool_calls.filter((call) => {
+          // 确保工具调用ID是有效的
+          return call.id && call.function && call.function.name;
         });
 
-        if (uniqueToolCalls.length === 0) {
-          // All tool calls were duplicates, just add content if available
+        if (validToolCalls.length === 0) {
+          // 所有工具调用都无效，只保留内容
           if (message.content) {
             result.push(
               new Message({
@@ -201,27 +218,31 @@ export abstract class BaseAgent {
           continue;
         }
 
-        const toolCallIds = uniqueToolCalls.map((call) => call.id);
-
-        const hasMatchingResults = toolCallIds.every((id) =>
+        // 检查这些工具调用是否都有对应的结果
+        const toolCallIds = validToolCalls.map((call) => call.id);
+        const hasAllResults = toolCallIds.every((id) =>
           messages.some((msg) => msg.tool_call_id === id)
         );
 
-        if (hasMatchingResults) {
-          if (uniqueToolCalls.length < message.tool_calls.length) {
-            // Some tool calls were removed, create new message with unique ones
+        if (hasAllResults) {
+          // 所有工具调用都有结果，保留消息
+          if (validToolCalls.length < (message.tool_calls?.length || 0)) {
+            // 有些工具调用被过滤掉了，创建新消息
             result.push(
               new Message({
                 role: message.role,
                 content: message.content,
-                tool_calls: uniqueToolCalls,
+                tool_calls: validToolCalls,
               })
             );
           } else {
             result.push(message);
           }
         } else {
-          this.logger.warn(`Removing incomplete tool call: ${toolCallIds.join(', ')}`);
+          // 有些工具调用没有结果，移除整个工具调用消息
+          this.logger.warn(
+            `Removing incomplete tool calls: ${toolCallIds.join(', ')} (missing results)`
+          );
           if (message.content) {
             result.push(
               new Message({
@@ -232,6 +253,46 @@ export abstract class BaseAgent {
           }
         }
       } else {
+        // 普通消息，直接添加
+        result.push(message);
+      }
+    }
+
+    // 验证最终结果的配对完整性
+    const finalValidation = this.validateMessagePairs(result);
+    if (finalValidation.length !== result.length) {
+      this.logger.warn(
+        `Final validation removed ${result.length - finalValidation.length} messages`
+      );
+    }
+
+    return finalValidation;
+  }
+
+  /**
+   * 最终验证消息配对
+   * 确保没有孤立的工具结果
+   */
+  private validateMessagePairs(messages: Message[]): Message[] {
+    const result: Message[] = [];
+    const availableToolCalls = new Map<string, Message>();
+
+    for (const message of messages) {
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        // 记录可用的工具调用
+        message.tool_calls.forEach((call) => {
+          availableToolCalls.set(call.id, message);
+        });
+        result.push(message);
+      } else if (message.tool_call_id) {
+        // 检查工具结果是否有对应的工具调用
+        if (availableToolCalls.has(message.tool_call_id)) {
+          result.push(message);
+        } else {
+          this.logger.warn(`Final check: removing orphaned tool result ${message.tool_call_id}`);
+        }
+      } else {
+        // 普通消息
         result.push(message);
       }
     }
@@ -322,10 +383,89 @@ export abstract class BaseAgent {
 
   /**
    * 从当前消息中提取查询
+   * 智能提取当前执行上下文的查询，考虑任务状态、最近对话和执行进度
    */
   protected extractCurrentQuery(): string {
-    const lastUserMessage = this.messages.filter((msg) => msg.role === Role.USER).pop();
-    return lastUserMessage?.content || '';
+    // 1. 首先尝试从最近的助手消息中提取当前关注点
+    const recentMessages = this.memory.messages.slice(-10);
+
+    // 2. 寻找最近的任务或工具相关内容
+    for (let i = recentMessages.length - 1; i >= 0; i--) {
+      const msg = recentMessages[i];
+
+      // 如果是助手消息且包含明确的任务描述
+      if (msg.role === Role.ASSISTANT && msg.content) {
+        const content = msg.content;
+
+        // 检查是否包含当前执行的任务或步骤信息
+        const taskIndicators = [
+          '正在执行',
+          '当前任务',
+          '下一步',
+          '现在需要',
+          '接下来',
+          '准备',
+          '开始',
+        ];
+
+        for (const indicator of taskIndicators) {
+          if (content.includes(indicator)) {
+            // 提取任务相关的句子
+            const sentences = content.split(/[.。!！\n]/);
+            for (const sentence of sentences) {
+              if (sentence.includes(indicator) && sentence.trim().length > 10) {
+                return sentence.trim();
+              }
+            }
+          }
+        }
+      }
+
+      // 如果是工具调用，提取工具相关的查询
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        const toolCall = msg.tool_calls[0];
+        const toolName = toolCall.function.name;
+
+        try {
+          const args = JSON.parse(toolCall.function.arguments || '{}');
+
+          // 根据不同工具类型提取相关查询
+          if (toolName.includes('search') || toolName.includes('Search')) {
+            return args.query || args.q || args.search_term || `搜索相关信息`;
+          } else if (toolName.includes('file') || toolName.includes('File')) {
+            return args.path ? `处理文件: ${args.path}` : '文件操作';
+          } else if (toolName.includes('browser') || toolName.includes('Browser')) {
+            return args.url ? `浏览: ${args.url}` : '浏览器操作';
+          } else {
+            return `使用${toolName}工具`;
+          }
+        } catch (error) {
+          return `使用${toolName}工具`;
+        }
+      }
+    }
+
+    // 3. 回退到分析最近的用户消息，但优先考虑最新的
+    const userMessages = this.memory.messages.filter((msg) => msg.role === Role.USER);
+    if (userMessages.length > 0) {
+      const lastUserMessage = userMessages[userMessages.length - 1];
+      const content = lastUserMessage.content || '';
+
+      // 如果最后的用户消息很短（可能是简单回复），尝试找更有意义的消息
+      if (content.length < 20) {
+        for (let i = userMessages.length - 2; i >= Math.max(0, userMessages.length - 5); i--) {
+          const prevMsg = userMessages[i];
+          if (prevMsg.content && prevMsg.content.length > 20) {
+            return prevMsg.content;
+          }
+        }
+      }
+
+      return content;
+    }
+
+    // 4. 最后的兜底方案
+    return '继续执行当前任务';
   }
 
   /**
