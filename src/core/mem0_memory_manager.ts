@@ -7,6 +7,7 @@ import { Memory } from 'mem0ai/oss';
 import { Message, Role } from '../schema/index.js';
 import { Logger } from '../utils/logger.js';
 import { config as manusConfig } from '../utils/config.js';
+import { EventEmitter } from 'events';
 import fs from 'fs';
 import path from 'path';
 
@@ -34,17 +35,46 @@ export interface MemoryAddResult {
   error?: string;
 }
 
+// 添加任务检查点接口
+export interface TaskCheckpoint {
+  id: string;
+  taskId: string;
+  timestamp: number;
+  canResume: boolean;
+  data?: any;
+}
+
+// 添加统计信息接口
+export interface MemoryStatistics {
+  totalEntries: number;
+  compressedEntries: number;
+}
+
 /**
  * Mem0 Memory Manager
  * 提供智能记忆管理功能
  */
-export class Mem0MemoryManager {
+export class Mem0MemoryManager extends EventEmitter {
   private memory?: Memory;
   private logger: Logger;
   private config: MemoryConfig;
   private userId: string;
 
+  // 添加本地存储用于兼容性
+  private checkpoints: Map<string, TaskCheckpoint> = new Map();
+  private tasks: Map<string, any> = new Map();
+  private statistics: MemoryStatistics = {
+    totalEntries: 0,
+    compressedEntries: 0,
+  };
+
+  // 新增：本地消息缓存，用于解决立即读取问题
+  private localMessageCache: Map<string, any> = new Map();
+  private cacheTimestamp: number = 0;
+  private readonly CACHE_TTL = 5000; // 5秒缓存时间
+
   constructor(config: MemoryConfig, userId: string = 'default_user') {
+    super();
     this.logger = new Logger('Mem0MemoryManager');
     this.config = config;
     this.userId = userId;
@@ -64,8 +94,6 @@ export class Mem0MemoryManager {
 
         // 配置 Mem0 使用指定的数据库路径和 manus 配置的 LLM
         const mem0Config = {
-          historyDbPath: dbPath,
-          vectorDbPath: vectorDbPath,
           llm: {
             provider: 'openai',
             config: {
@@ -106,6 +134,13 @@ export class Mem0MemoryManager {
             config: {
               collection_name: `manus_memory_${taskType}`,
               embedding_model_dims: 1536,
+              dbPath: vectorDbPath,
+            },
+          },
+          historyStore: {
+            provider: 'sqlite',
+            config: {
+              historyDbPath: dbPath,
             },
           },
         };
@@ -165,6 +200,9 @@ export class Mem0MemoryManager {
         ...metadata,
       });
 
+      // 立即更新本地缓存，解决立即读取问题
+      this.updateLocalCache(mem0Messages, metadata);
+
       this.logger.info(`Added conversation to memory`);
 
       return {
@@ -176,6 +214,102 @@ export class Mem0MemoryManager {
       this.logger.error(`Error details:`, error);
       return { success: false, error: String(error) };
     }
+  }
+
+  /**
+   * 更新本地缓存
+   */
+  private updateLocalCache(messages: any[], metadata?: any): void {
+    const now = Date.now();
+    this.cacheTimestamp = now;
+
+    for (const message of messages) {
+      const cacheKey = `${message.role}:${message.content?.substring(0, 50)}`;
+      this.localMessageCache.set(cacheKey, {
+        message,
+        metadata,
+        timestamp: now,
+      });
+    }
+
+    // 清理过期缓存
+    this.cleanupExpiredCache();
+  }
+
+  /**
+   * 清理过期缓存
+   */
+  private cleanupExpiredCache(): void {
+    const now = Date.now();
+    const expiredKeys: string[] = [];
+
+    for (const [key, value] of this.localMessageCache.entries()) {
+      if (now - value.timestamp > this.CACHE_TTL) {
+        expiredKeys.push(key);
+      }
+    }
+
+    for (const key of expiredKeys) {
+      this.localMessageCache.delete(key);
+    }
+  }
+
+  /**
+   * 强制刷新缓存，确保最新消息可立即读取
+   */
+  async refreshCache(): Promise<void> {
+    try {
+      if (!this.isEnabled() || !this.memory) {
+        return;
+      }
+
+      // 清空本地缓存
+      this.localMessageCache.clear();
+      this.cacheTimestamp = 0;
+
+      // 从 Mem0 重新加载最近的记忆
+      const recentMemories = await this.memory.search('', {
+        limit: 50,
+        userId: this.userId,
+      });
+
+      // 重新构建本地缓存
+      for (const result of recentMemories.results || []) {
+        const cacheKey = `recent:${result.id || Date.now()}`;
+        this.localMessageCache.set(cacheKey, {
+          message: {
+            role: 'assistant',
+            content: result.memory || '',
+          },
+          metadata: result.metadata || {},
+          timestamp: Date.now(),
+        });
+      }
+
+      this.logger.debug(`Refreshed cache with ${this.localMessageCache.size} items`);
+    } catch (error) {
+      this.logger.error(`Failed to refresh cache: ${error}`);
+    }
+  }
+
+  /**
+   * 获取缓存状态信息
+   */
+  getCacheStatus(): {
+    size: number;
+    timestamp: number;
+    ttl: number;
+    isExpired: boolean;
+  } {
+    const now = Date.now();
+    const isExpired = now - this.cacheTimestamp > this.CACHE_TTL;
+
+    return {
+      size: this.localMessageCache.size,
+      timestamp: this.cacheTimestamp,
+      ttl: this.CACHE_TTL,
+      isExpired,
+    };
   }
 
   /**
@@ -204,48 +338,104 @@ export class Mem0MemoryManager {
   }
 
   /**
-   * 搜索相关记忆
+   * 搜索记忆
    */
-  async searchMemories(query: string, limit?: number): Promise<MemorySearchResult[]> {
+  async searchMemories(query: string, limit: number = 10): Promise<MemorySearchResult[]> {
     if (!this.isEnabled() || !this.memory) {
-      this.logger.warn('Memory manager is disabled or memory not initialized');
       return [];
     }
 
     try {
-      const searchLimit = limit || this.config.searchLimit;
+      const results: MemorySearchResult[] = [];
 
-      // 先检查是否有任何记忆存在
-      const allMemories = await this.getAllMemories();
+      // 1. 首先从本地缓存搜索（解决立即读取问题）
+      const localResults = this.searchLocalCache(query, limit);
+      results.push(...localResults);
 
-      const results = await this.memory.search(query, {
+      // 2. 从 Mem0 搜索
+      const mem0Results = await this.memory.search(query, {
+        limit: Math.max(limit - localResults.length, 1),
         userId: this.userId,
-        limit: searchLimit,
       });
 
-      const memories: MemorySearchResult[] =
-        results.results?.map((result) => ({
-          memory: result.memory,
+      // 转换 Mem0 结果格式
+      for (const result of mem0Results.results || []) {
+        results.push({
+          memory: result.memory || '',
           score: result.score || 0,
-          metadata: result.metadata,
-        })) || [];
-
-      this.logger.info(
-        `Found ${memories.length} relevant memories for query: ${query.substring(0, 50)}...`
-      );
-
-      if (memories.length === 0 && allMemories.length > 0) {
-        this.logger.warn(
-          `No search results found despite having ${allMemories.length} total memories. This might indicate a search configuration issue.`
-        );
+          metadata: result.metadata || {},
+        });
       }
 
-      return memories;
+      // 去重并按分数排序
+      const uniqueResults = this.deduplicateResults(results);
+      return uniqueResults.slice(0, limit);
     } catch (error) {
       this.logger.error(`Failed to search memories: ${error}`);
-      this.logger.error(`Error details:`, error);
       return [];
     }
+  }
+
+  /**
+   * 从本地缓存搜索
+   */
+  private searchLocalCache(query: string, limit: number): MemorySearchResult[] {
+    const results: MemorySearchResult[] = [];
+    const lowerQuery = query.toLowerCase();
+
+    for (const [key, value] of this.localMessageCache.entries()) {
+      const content = value.message.content?.toLowerCase() || '';
+      if (content.includes(lowerQuery)) {
+        // 计算简单的相关性分数
+        const score = this.calculateRelevanceScore(content, lowerQuery);
+        results.push({
+          memory: value.message.content,
+          score,
+          metadata: value.metadata || {},
+        });
+      }
+    }
+
+    // 按分数排序
+    return results.sort((a, b) => b.score - a.score).slice(0, limit);
+  }
+
+  /**
+   * 计算相关性分数
+   */
+  private calculateRelevanceScore(content: string, query: string): number {
+    const words = query.split(' ');
+    let score = 0;
+
+    for (const word of words) {
+      if (content.includes(word)) {
+        score += 0.3;
+        // 完全匹配加分
+        if (content.includes(` ${word} `) || content.startsWith(word) || content.endsWith(word)) {
+          score += 0.2;
+        }
+      }
+    }
+
+    return Math.min(score, 1.0);
+  }
+
+  /**
+   * 去重搜索结果
+   */
+  private deduplicateResults(results: MemorySearchResult[]): MemorySearchResult[] {
+    const seen = new Set<string>();
+    const unique: MemorySearchResult[] = [];
+
+    for (const result of results) {
+      const key = `${result.memory}:${result.score}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(result);
+      }
+    }
+
+    return unique;
   }
 
   /**
@@ -342,7 +532,7 @@ export class Mem0MemoryManager {
 
       // 辅助函数：生成消息的唯一标识（用于去重）
       const getMessageKey = (msg: Message): string => {
-        return `${msg.role}:${msg.content?.substring(0, 100) || ''}`;
+        return `${msg.role}:${msg.tool_call_id || 'no_tool'}${msg.content?.substring(0, 200) || ''}`;
       };
 
       // 辅助函数：安全添加消息（避免重复）
@@ -420,7 +610,13 @@ export class Mem0MemoryManager {
     metadata?: any
   ): Promise<void> {
     try {
-      if (!this.isEnabled() || !content || content.length < 5) {
+      if (!this.isEnabled() || !content || content.length < 10) {
+        return;
+      }
+
+      // 只记录关键对话：任务创建、重要决策、错误处理
+      const isKeyConversation = this.isKeyConversation(content, role, metadata);
+      if (!isKeyConversation) {
         return;
       }
 
@@ -436,11 +632,93 @@ export class Mem0MemoryManager {
       if (!result.success) {
         this.logger.warn(`Failed to record conversation: ${result.error}`);
       } else {
-        this.logger.debug(`Recorded conversation for ${role}: ${content.substring(0, 100)}...`);
+        this.logger.debug(`Recorded key conversation for ${role}: ${content.substring(0, 100)}...`);
+
+        // 立即更新本地缓存，确保可以立即读取
+        this.updateLocalCache([{ role, content }], metadata);
       }
     } catch (error) {
       this.logger.error('Error recording conversation:', error);
     }
+  }
+
+  /**
+   * 判断是否为关键对话
+   */
+  private isKeyConversation(content: string, role: 'user' | 'assistant', metadata?: any): boolean {
+    const lowerContent = content.toLowerCase();
+
+    // 用户关键对话
+    if (role === 'user') {
+      // 任务相关关键词
+      const taskKeywords = [
+        'create',
+        'task',
+        'project',
+        'build',
+        'develop',
+        'implement',
+        'fix',
+        'bug',
+        'error',
+        'problem',
+        'issue',
+        'help',
+        'important',
+        'urgent',
+        'critical',
+        'priority',
+      ];
+
+      // 检查是否包含任务相关关键词
+      const hasTaskKeywords = taskKeywords.some((keyword) => lowerContent.includes(keyword));
+      if (hasTaskKeywords) return true;
+
+      // 检查元数据中的重要性
+      if (metadata?.importance > 0.8) return true;
+
+      // 检查是否为任务创建消息
+      if (
+        metadata?.messageType === 'task_creation' ||
+        metadata?.messageType === 'task_instruction'
+      ) {
+        return true;
+      }
+    }
+
+    // 助手关键回复
+    if (role === 'assistant') {
+      // 包含工具调用的回复
+      if (metadata?.tool_calls && metadata.tool_calls.length > 0) return true;
+
+      // 包含重要决策或解决方案的回复
+      const decisionKeywords = [
+        'solution',
+        'plan',
+        'strategy',
+        'approach',
+        'recommendation',
+        'decision',
+        'conclusion',
+        'result',
+        'success',
+        'completed',
+        'error',
+        'failed',
+        'warning',
+        'critical',
+      ];
+
+      const hasDecisionKeywords = decisionKeywords.some((keyword) =>
+        lowerContent.includes(keyword)
+      );
+      if (hasDecisionKeywords) return true;
+
+      // 长回复通常包含重要信息
+      if (content.length > 200) return true;
+    }
+
+    return false;
   }
 
   /**
@@ -484,7 +762,7 @@ export class Mem0MemoryManager {
    * 获取默认向量数据库路径
    */
   private getDefaultVectorDbPath(): string {
-    return path.join('.manus', 'vector_db');
+    return path.join('.manus', 'vector_store.db');
   }
 
   /**
@@ -562,5 +840,260 @@ export class Mem0MemoryManager {
       fs.mkdirSync(dir, { recursive: true });
       this.logger.info(`Created directory: ${dir}`);
     }
+  }
+
+  /**
+   * 记录重要事件（兼容性方法）
+   */
+  async recordImportantEvent(type: string, data: any, importance?: number): Promise<void> {
+    try {
+      if (!this.isEnabled()) {
+        return;
+      }
+
+      // 只记录真正重要的事件
+      const criticalEvents = [
+        'system_start',
+        'system_shutdown',
+        'service_failure',
+        'critical_error',
+        'task_completed',
+        'task_failed',
+        'config_change',
+        'recovery',
+      ];
+
+      // 检查是否为关键事件
+      const isCriticalEvent = criticalEvents.includes(type);
+      const hasHighImportance = (importance || 0) > 0.8;
+
+      if (!isCriticalEvent && !hasHighImportance) {
+        return;
+      }
+
+      const eventContent = `重要事件: ${type} - ${JSON.stringify(data)}`;
+      await this.recordConversation('assistant', eventContent, {
+        type: 'important_event',
+        eventType: type,
+        importance: importance || 0.5,
+        timestamp: Date.now(),
+      });
+
+      this.statistics.totalEntries++;
+      this.emit('memory_stored', { type, data, importance });
+    } catch (error) {
+      this.logger.error(`Failed to record important event: ${error}`);
+    }
+  }
+
+  /**
+   * 获取统计信息（兼容性方法）
+   */
+  async getStatistics(): Promise<MemoryStatistics> {
+    return this.statistics;
+  }
+
+  /**
+   * 查询记忆（兼容性方法）
+   */
+  async queryMemories(query: any): Promise<any[]> {
+    try {
+      if (!this.isEnabled()) {
+        return [];
+      }
+
+      const results: any[] = [];
+
+      // 1. 从本地缓存查询（解决立即读取问题）
+      const localResults = this.queryLocalCache(query);
+      results.push(...localResults);
+
+      // 2. 从 Mem0 查询
+      if (this.memory) {
+        try {
+          const mem0Query = this.buildMem0Query(query);
+          const mem0Results = await this.memory.search(mem0Query.query, {
+            limit: mem0Query.limit,
+            userId: this.userId,
+          });
+
+          // 转换结果格式
+          for (const result of mem0Results.results || []) {
+            results.push({
+              id: result.id || `mem0_${Date.now()}`,
+              content: result.memory || '',
+              score: result.score || 0,
+              metadata: result.metadata || {},
+              timestamp: Date.now(),
+            });
+          }
+        } catch (error) {
+          this.logger.warn(`Mem0 query failed, using local cache only: ${error}`);
+        }
+      }
+
+      // 去重并按相关性排序
+      return this.deduplicateQueryResults(results);
+    } catch (error) {
+      this.logger.error(`Failed to query memories: ${error}`);
+      return [];
+    }
+  }
+
+  /**
+   * 从本地缓存查询
+   */
+  private queryLocalCache(query: any): any[] {
+    const results: any[] = [];
+    const queryText = query.query || query.text || '';
+
+    for (const [key, value] of this.localMessageCache.entries()) {
+      const content = value.message.content || '';
+      const metadata = value.metadata || {};
+
+      // 检查是否匹配查询条件
+      if (this.matchesQuery(value, query)) {
+        results.push({
+          id: key,
+          content,
+          score: this.calculateRelevanceScore(content, queryText),
+          metadata,
+          timestamp: value.timestamp,
+        });
+      }
+    }
+
+    return results.sort((a, b) => b.score - a.score);
+  }
+
+  /**
+   * 检查是否匹配查询条件
+   */
+  private matchesQuery(cacheItem: any, query: any): boolean {
+    const content = cacheItem.message.content?.toLowerCase() || '';
+    const queryText = (query.query || query.text || '').toLowerCase();
+
+    // 文本匹配
+    if (queryText && content.includes(queryText)) {
+      return true;
+    }
+
+    // 标签匹配
+    if (query.tags && Array.isArray(query.tags)) {
+      const metadata = cacheItem.metadata || {};
+      const itemTags = metadata.tags || [];
+      return query.tags.some((tag: string) => itemTags.includes(tag));
+    }
+
+    // 类型匹配
+    if (query.types && Array.isArray(query.types)) {
+      const metadata = cacheItem.metadata || {};
+      const itemType = metadata.type || 'conversation';
+      return query.types.includes(itemType);
+    }
+
+    return false;
+  }
+
+  /**
+   * 构建 Mem0 查询
+   */
+  private buildMem0Query(query: any): { query: string; limit: number } {
+    let searchQuery = '';
+    let limit = 10;
+
+    if (typeof query === 'string') {
+      searchQuery = query;
+    } else if (query.query || query.text) {
+      searchQuery = query.query || query.text;
+    } else {
+      // 从标签或类型构建查询
+      const parts = [];
+      if (query.tags) parts.push(...query.tags);
+      if (query.types) parts.push(...query.types);
+      searchQuery = parts.join(' ');
+    }
+
+    if (query.limit) {
+      limit = Math.min(query.limit, 50);
+    }
+
+    return { query: searchQuery, limit };
+  }
+
+  /**
+   * 去重查询结果
+   */
+  private deduplicateQueryResults(results: any[]): any[] {
+    const seen = new Set<string>();
+    const unique: any[] = [];
+
+    for (const result of results) {
+      const key = `${result.content}:${result.score}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(result);
+      }
+    }
+
+    return unique;
+  }
+
+  /**
+   * 获取相关记忆（兼容性方法）
+   */
+  async getRelatedMemories(entryId: string, limit: number = 10): Promise<any[]> {
+    try {
+      if (!this.isEnabled() || !this.memory) {
+        return [];
+      }
+
+      // 简化实现：使用 entryId 作为查询词
+      const searchResults = await this.searchMemories(entryId, limit);
+
+      return searchResults.map((result) => ({
+        id: entryId,
+        content: result.memory,
+        score: result.score,
+        metadata: result.metadata,
+      }));
+    } catch (error) {
+      this.logger.error(`Failed to get related memories: ${error}`);
+      return [];
+    }
+  }
+
+  /**
+   * 保存检查点（兼容性方法）
+   */
+  async saveCheckpoint(taskId: string, checkpoint: TaskCheckpoint): Promise<void> {
+    try {
+      this.checkpoints.set(checkpoint.id, checkpoint);
+      this.logger.debug(`Saved checkpoint for task ${taskId}: ${checkpoint.id}`);
+    } catch (error) {
+      this.logger.error(`Failed to save checkpoint: ${error}`);
+    }
+  }
+
+  /**
+   * 获取检查点（兼容性方法）
+   */
+  async getCheckpoints(): Promise<TaskCheckpoint[]> {
+    return Array.from(this.checkpoints.values());
+  }
+
+  /**
+   * 根据ID获取任务（兼容性方法）
+   */
+  async getTaskById(taskId: string): Promise<any | null> {
+    return this.tasks.get(taskId) || null;
+  }
+
+  /**
+   * 保存任务（兼容性方法）
+   */
+  async saveTask(taskId: string, task: any): Promise<void> {
+    this.tasks.set(taskId, task);
+    this.logger.debug(`Saved task: ${taskId}`);
   }
 }

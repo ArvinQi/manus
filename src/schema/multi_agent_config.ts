@@ -4,7 +4,21 @@
 
 import { z } from 'zod';
 
-// MCP 服务配置
+// 简化的MCP服务配置 (新的通用格式)
+export const SimpleMcpServerConfigSchema = z.object({
+  command: z.string().describe('启动命令'),
+  args: z.array(z.string()).describe('命令参数'),
+  enabled: z.boolean().default(true).describe('是否启用'),
+  type: z.enum(['stdio', 'http', 'websocket']).default('stdio').describe('连接类型'),
+  url: z.string().optional().describe('HTTP/WebSocket连接URL'),
+  timeout: z.number().default(30000).describe('连接超时时间(ms)'),
+  retry_count: z.number().default(3).describe('重试次数'),
+  capabilities: z.array(z.string()).optional().describe('服务能力列表'),
+  priority: z.number().default(1).describe('优先级，数字越大优先级越高'),
+  metadata: z.record(z.any()).optional().describe('额外元数据')
+});
+
+// 原有的完整MCP服务配置 (向后兼容)
 export const McpServiceConfigSchema = z.object({
   name: z.string().describe('MCP服务名称'),
   type: z.enum(['stdio', 'http', 'websocket']).describe('连接类型'),
@@ -103,21 +117,24 @@ export const DecisionEngineConfigSchema = z.object({
 
 // 多代理系统配置
 export const MultiAgentSystemConfigSchema = z.object({
-  mcp_services: z.array(McpServiceConfigSchema).describe('MCP服务列表'),
+  mcpServers: z.record(SimpleMcpServerConfigSchema).optional().describe('MCP服务配置'),
   a2a_agents: z.array(A2AAgentConfigSchema).describe('A2A代理列表'),
   routing_rules: z.array(TaskRoutingRuleSchema).describe('任务路由规则'),
   memory_config: MemoryConfigSchema.describe('记忆管理配置'),
   task_management: TaskManagementConfigSchema.describe('任务管理配置'),
   decision_engine: DecisionEngineConfigSchema.describe('决策引擎配置'),
-  system: z.object({
-    name: z.string().default('Manus-MultiAgent').describe('系统名称'),
-    version: z.string().default('2.0.0').describe('系统版本'),
-    debug_mode: z.boolean().default(false).describe('调试模式'),
-    log_level: z.enum(['debug', 'info', 'warn', 'error']).default('info').describe('日志级别')
-  }).describe('系统配置')
+  system: z
+    .object({
+      name: z.string().default('Manus-MultiAgent').describe('系统名称'),
+      version: z.string().default('2.0.0').describe('系统版本'),
+      debug_mode: z.boolean().default(false).describe('调试模式'),
+      log_level: z.enum(['debug', 'info', 'warn', 'error']).default('info').describe('日志级别'),
+    })
+    .describe('系统配置'),
 });
 
 // 导出类型
+export type SimpleMcpServerConfig = z.infer<typeof SimpleMcpServerConfigSchema>;
 export type McpServiceConfig = z.infer<typeof McpServiceConfigSchema>;
 export type A2AAgentConfig = z.infer<typeof A2AAgentConfigSchema>;
 export type TaskRoutingRule = z.infer<typeof TaskRoutingRuleSchema>;

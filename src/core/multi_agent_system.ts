@@ -10,7 +10,7 @@ import { MultiMcpManager } from '../mcp/multi_mcp_manager.js';
 import { A2AAgentManager } from '../agent/a2a_agent_manager.js';
 import { DecisionEngine, Task } from './decision_engine.js';
 import { TaskManager, TaskStatus } from './task_manager.js';
-import { MemoryManager } from './memory_manager.js';
+import { Mem0MemoryManager } from './mem0_memory_manager.js';
 import { ToolRouter, RoutingStrategy } from './tool_router.js';
 
 // 系统状态
@@ -73,7 +73,7 @@ export class MultiAgentSystem extends EventEmitter {
   // 核心组件
   private mcpManager: MultiMcpManager;
   private agentManager: A2AAgentManager;
-  private memoryManager: MemoryManager;
+  private memoryManager?: Mem0MemoryManager;
   private decisionEngine: DecisionEngine;
   private taskManager: TaskManager;
   private toolRouter: ToolRouter;
@@ -85,7 +85,7 @@ export class MultiAgentSystem extends EventEmitter {
   private priorityTaskInterval?: NodeJS.Timeout;
   private interruptQueue: Task[] = [];
 
-  constructor(config: MultiAgentSystemConfig) {
+  constructor(config: MultiAgentSystemConfig, memoryManager?: Mem0MemoryManager) {
     super();
     this.logger = new Logger('MultiAgentSystem');
     this.config = config;
@@ -93,7 +93,7 @@ export class MultiAgentSystem extends EventEmitter {
     // 初始化组件
     this.mcpManager = new MultiMcpManager();
     this.agentManager = new A2AAgentManager();
-    this.memoryManager = new MemoryManager(config.memory_config, this.mcpManager);
+    this.memoryManager = memoryManager;
     this.decisionEngine = new DecisionEngine(
       config.decision_engine,
       config.routing_rules,
@@ -129,20 +129,32 @@ export class MultiAgentSystem extends EventEmitter {
 
     try {
       // 1. 初始化记忆管理器
-      this.logger.info('初始化记忆管理器...');
-      await this.memoryManager.initialize();
-      await this.recordSystemEvent('memory_manager_initialized', {}, 'info');
+      // this.logger.info('初始化记忆管理器...');
+      // await this.memoryManager.initialize();
+      // await this.recordSystemEvent('memory_manager_initialized', {}, 'info');
 
       // 2. 初始化MCP服务
       this.logger.info('初始化MCP服务...');
-      await this.mcpManager.initialize(this.config.mcp_services);
-      await this.recordSystemEvent(
-        'mcp_services_initialized',
-        {
-          count: this.config.mcp_services.length,
-        },
-        'info'
-      );
+
+      const mcpConfig = this.config.mcpServers;
+      if (mcpConfig && Object.keys(mcpConfig).length > 0) {
+        await this.mcpManager.initialize(mcpConfig);
+        const configSize = Object.keys(mcpConfig).length;
+
+        this.logger.info(`使用新格式初始化 ${configSize} 个MCP服务`);
+
+        await this.recordSystemEvent(
+          'mcp_services_initialized',
+          {
+            count: configSize,
+            format: 'mcpServers',
+          },
+          'info'
+        );
+      } else {
+        this.logger.warn('未找到MCP服务配置');
+        await this.recordSystemEvent('mcp_services_initialized', { count: 0 }, 'warning');
+      }
 
       // 3. 初始化A2A代理
       this.logger.info('初始化A2A代理...');
@@ -186,6 +198,7 @@ export class MultiAgentSystem extends EventEmitter {
 
       this.emit('started');
     } catch (error) {
+      console.log('🚀🚀🚀🚀🚀🚀 ~ MultiAgentSystem ~ start ~ error:', error);
       this.status = SystemStatus.ERROR;
       this.logger.error('系统启动失败:', error);
 
@@ -225,7 +238,7 @@ export class MultiAgentSystem extends EventEmitter {
       await this.mcpManager.shutdown();
 
       // 清理记忆管理器
-      await this.memoryManager.cleanup();
+      // await this.memoryManager.cleanup();
 
       this.status = SystemStatus.STOPPED;
       this.logger.info('多代理系统已停止');
@@ -307,10 +320,10 @@ export class MultiAgentSystem extends EventEmitter {
     this.logger.info(`提交任务: ${task.id} - ${taskDescription}`);
 
     // 记录为重要事件而不是用户交互
-    await this.memoryManager.recordImportantEvent('task_submission', {
-      taskId: task.id,
-      description: taskDescription, // 限制长度
-    });
+    // await this.memoryManager?.recordImportantEvent('task_submission', {
+    //   taskId: task.id,
+    //   description: taskDescription, // 限制长度
+    // });
 
     // 提交到任务管理器
     const taskId = await this.taskManager.submitTask(task);
@@ -352,10 +365,10 @@ export class MultiAgentSystem extends EventEmitter {
     this.logger.info(`插入高优先级任务: ${task.id} - ${taskDescription}`);
 
     // 记录为重要事件
-    await this.memoryManager.recordImportantEvent('urgent_task_submission', {
-      taskId: task.id,
-      description: taskDescription.substring(0, 100), // 限制长度
-    });
+    // await this.memoryManager?.recordImportantEvent('urgent_task_submission', {
+    //   taskId: task.id,
+    //   description: taskDescription.substring(0, 100), // 限制长度
+    // });
 
     // 插入高优先级任务
     const taskId = await this.taskManager.insertHighPriorityTask(task);
@@ -414,7 +427,7 @@ export class MultiAgentSystem extends EventEmitter {
     const queueStatus = this.taskManager.getQueueStatus();
     const mcpServices = await this.mcpManager.getServiceStatistics();
     const agents = await this.agentManager.getAgentStatistics();
-    const memoryStats = await this.memoryManager.getStatistics();
+    // const memoryStats = await this.memoryManager?.getStatistics();
     const decisionStats = this.decisionEngine.getStatistics();
 
     return {
@@ -434,9 +447,12 @@ export class MultiAgentSystem extends EventEmitter {
         busy: agents.busy,
       },
       memory: {
-        totalEntries: memoryStats.totalEntries,
+        totalEntries: 0,
+        // totalEntries: memoryStats?.totalEntries || 0,
         cacheSize: 0, // 简化实现
-        compressionRate: memoryStats.compressedEntries / Math.max(memoryStats.totalEntries, 1),
+        compressionRate: 1,
+        // compressionRate:
+        // (memoryStats?.compressedEntries || 0) / Math.max(memoryStats?.totalEntries || 1, 1),
       },
       performance: {
         averageTaskTime: taskStats.averageExecutionTime,
@@ -457,14 +473,14 @@ export class MultiAgentSystem extends EventEmitter {
    * 查询记忆
    */
   async queryMemories(query: any): Promise<any[]> {
-    return await this.memoryManager.queryMemories(query);
+    return (await this.memoryManager?.queryMemories(query)) || [];
   }
 
   /**
    * 获取相关记忆
    */
   async getRelatedMemories(entryId: string, limit: number = 10): Promise<any[]> {
-    return await this.memoryManager.getRelatedMemories(entryId, limit);
+    return (await this.memoryManager?.getRelatedMemories(entryId, limit)) || [];
   }
 
   /**
@@ -562,7 +578,7 @@ export class MultiAgentSystem extends EventEmitter {
     });
 
     // 记忆管理器事件
-    this.memoryManager.on('memory_stored', (data) => {
+    this.memoryManager?.on('memory_stored', (data) => {
       this.recordSystemEvent('memory_stored', data, 'info');
     });
   }
@@ -591,11 +607,17 @@ export class MultiAgentSystem extends EventEmitter {
     }
 
     // 记录到内存管理器（只记录重要事件）
-    try {
-      const importanceScore = severity === 'error' ? 0.9 : severity === 'warning' ? 0.7 : 0.5;
-      await this.memoryManager.recordImportantEvent(type, data, importanceScore);
-    } catch (error) {
-      this.logger.error(`记录系统事件失败: ${error}`);
+    if (this.memoryManager) {
+      try {
+        const importanceScore = severity === 'error' ? 0.9 : severity === 'warning' ? 0.7 : 0.5;
+
+        // 只记录错误和警告事件，跳过一般信息事件
+        if (severity === 'error' || severity === 'warning') {
+          await this.memoryManager.recordImportantEvent(type, data, importanceScore);
+        }
+      } catch (error) {
+        this.logger.error(`记录系统事件失败: ${error}`);
+      }
     }
 
     this.emit('system_event', event);
@@ -708,7 +730,7 @@ export class MultiAgentSystem extends EventEmitter {
   /**
    * 获取记忆管理器
    */
-  getMemoryManager(): MemoryManager {
+  getMemoryManager(): Mem0MemoryManager | undefined {
     return this.memoryManager;
   }
 

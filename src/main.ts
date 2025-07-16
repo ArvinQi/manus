@@ -24,7 +24,10 @@ const logger = new Logger('Main');
 export async function main() {
   const continueTask = process.argv.includes('--continue');
   // const useMcpServer = process.argv.includes('--use-mcp-server');
-  const maxSteps = parseInt(process.argv[3], 10) || 1000;
+
+  // --max-steps 最大步骤数
+  const maxStepsArgIndex = process.argv.indexOf('--max-steps');
+  const maxSteps = maxStepsArgIndex !== -1 ? parseInt(process.argv[maxStepsArgIndex + 1], 10) : 30;
 
   // 检查是否指定了MD文件
   const fileArgIndex = process.argv.indexOf('--file');
@@ -36,7 +39,6 @@ export async function main() {
       maxSteps,
       // useMcpServer,
       continueTask,
-      enableMultiAgent: true, // 默认启用多智能体系统
     }),
   };
 

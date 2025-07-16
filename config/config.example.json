@@ -77,48 +77,25 @@
   "workspace": {
     "root": "."
   },
-  "mcp_servers": [
-    {
-      "name": "filesystem",
-      "enabled": true,
-      "type": "stdio",
+  "mcpServers": {
+    "filesystem": {
       "command": "npx",
       "args": [
         "-y",
         "@modelcontextprotocol/server-filesystem",
-        "/tmp"
-      ],
-      "capabilities": [
-        "filesystem",
-        "read",
-        "write",
-        "search"
-      ],
-      "priority": 1,
-      "timeout": 30000,
-      "retry_count": 3,
-      "metadata": {
-        "description": "文件系统操作服务"
-      }
+        "/Users/username/Desktop",
+        "/path/to/other/allowed/dir"
+      ]
     },
-    {
-      "name": "web_search",
-      "enabled": false,
-      "type": "http",
-      "url": "http://localhost:3001/mcp",
-      "capabilities": [
-        "search",
-        "web",
-        "scraping"
+    "web_search": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-web-search"
       ],
-      "priority": 2,
-      "timeout": 10000,
-      "retry_count": 2,
-      "metadata": {
-        "description": "网络搜索和爬虫服务"
-      }
+      "enabled": false
     }
-  ],
+  },
   "a2a_agents": [
     {
       "name": "coding_agent",

@@ -115,11 +115,27 @@ export class ConversationContextManager {
 
       // 记录到内存管理器（如果启用）
       if (this.memoryManager && importance > this.config.importanceThreshold) {
-        await this.memoryManager.recordConversation(
-          message.role as 'user' | 'assistant',
-          message.content || '',
-          { ...metadata, sessionId, topicId, importance }
-        );
+        // 提高重要性阈值，只记录真正重要的消息
+        const enhancedThreshold = Math.max(this.config.importanceThreshold, 0.7);
+        if (importance >= enhancedThreshold) {
+          await this.memoryManager.recordConversation(
+            message.role as 'user' | 'assistant',
+            message.content || '',
+            { ...metadata, sessionId, topicId, importance }
+          );
+
+          // 立即刷新缓存，确保最新消息可立即读取（仅对 Mem0MemoryManager）
+          try {
+            if (
+              'refreshCache' in this.memoryManager &&
+              typeof this.memoryManager.refreshCache === 'function'
+            ) {
+              await (this.memoryManager as any).refreshCache();
+            }
+          } catch (error) {
+            this.logger.warn(`Failed to refresh memory cache: ${error}`);
+          }
+        }
       }
 
       // 检查是否需要摘要

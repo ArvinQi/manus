@@ -258,6 +258,26 @@ export class LLM {
     const startTime = Date.now();
     let lastError: any;
 
+    // 打印LLM调用开始日志
+    const llmConfig = config.getLLMConfig(this.configName);
+    this.logger.info(`🚀 开始LLM调用 - 模型: ${llmConfig.model}, 配置: ${this.configName}`);
+    this.logger.info(
+      `📝 输入消息数量: ${options.messages.length}, 系统消息数量: ${options.systemMsgs?.length || 0}`
+    );
+    this.logger.info(
+      `🛠️ 工具数量: ${options.tools?.length || 0}, 工具选择模式: ${options.toolChoice || 'auto'}`
+    );
+
+    // 打印第一条和最后一条消息的摘要
+    if (options.messages.length > 0) {
+      // const firstMsg = options.messages[0];
+      const lastMsg = options.messages[options.messages.length - 1];
+
+      this.logger.info(
+        `📤 最后一条消息: ${lastMsg.role} - ${(lastMsg.content || '').substring(0, 100)}${(lastMsg.content || '').length > 100 ? '...' : ''}`
+      );
+    }
+
     for (let attempt = 0; attempt <= this.retryConfig.maxRetries; attempt++) {
       try {
         // 如果不是第一次尝试，需要等待
@@ -269,22 +289,45 @@ export class LLM {
           await this.delay(delayMs);
         }
 
-        const llmConfig = config.getLLMConfig(this.configName);
-
         // 合并系统消息和用户消息
         const allMessages = [...(options.systemMsgs || []), ...options.messages];
 
         // 确保消息有效性
-        const validatedMessages = this.ensureValidMessages(allMessages);
+        // const validatedMessages = this.ensureValidMessages(allMessages);
 
         // 准备消息格式
-        const formattedMessages = validatedMessages.map((msg: Message) => ({
+        const formattedMessages = allMessages.map((msg: Message) => ({
           role: msg.role as any, // 类型转换以匹配 OpenAI API
           content: msg.content,
           ...(msg.tool_calls && { tool_calls: msg.tool_calls }),
-          ...(msg.tool_call_id && { tool_call_id: msg.tool_call_id }),
+          ...(msg.tool_call_id && {
+            tool_call_id: msg.tool_call_id,
+            tool_result: msg.content,
+            role: 'user',
+            // content: [
+            //   {
+            //     type: 'tool_result',
+            //     tool_use_id: msg.tool_call_id,
+            //     content: [{ type: 'text', text: msg.content }],
+            //   },
+            // ],
+            // content: [
+            //   {
+            //     toolResult: {
+            //       content: [{ text: msg.content }],
+            //       toolUseId: msg.tool_call_id,
+            //     },
+            //   },
+            // ],
+          }),
           ...(msg.name && { name: msg.name }),
         }));
+
+        // 打印请求参数
+        this.logger.info(`📡 发送LLM请求 - 尝试次数: ${attempt + 1}`);
+        this.logger.info(
+          `🔧 请求参数: model=${llmConfig.model}, temperature=${llmConfig.temperature}, max_tokens=${llmConfig.max_tokens}`
+        );
 
         // 发送请求
         const response = await this.client.chat.completions.create({
@@ -304,6 +347,23 @@ export class LLM {
 
         const executionTime = Date.now() - startTime;
 
+        // 打印响应结果
+        this.logger.info(`✅ LLM调用成功 - 执行时间: ${executionTime}ms`);
+        this.logger.info(`📄 响应内容长度: ${(llmResponse.content || '').length} 字符`);
+        this.logger.info(`🛠️ 工具调用数量: ${llmResponse.tool_calls?.length || 0}`);
+
+        if (llmResponse.tool_calls && llmResponse.tool_calls.length > 0) {
+          this.logger.info(
+            `🔧 工具调用详情: ${llmResponse.tool_calls.map((call) => call.function.name).join(', ')}`
+          );
+        }
+
+        if (llmResponse.usage) {
+          this.logger.info(
+            `📊 Token使用情况: prompt_tokens=${llmResponse.usage.prompt_tokens}, completion_tokens=${llmResponse.usage.completion_tokens}, total_tokens=${llmResponse.usage.total_tokens}`
+          );
+        }
+
         // 记录详细任务日志
         await this.logTaskDetails(options, llmResponse, undefined, executionTime);
 
@@ -313,6 +373,16 @@ export class LLM {
         return llmResponse;
       } catch (error: any) {
         lastError = error;
+        const executionTime = Date.now() - startTime;
+
+        // 打印错误信息
+        this.logger.error(
+          `❌ LLM调用失败 - 尝试次数: ${attempt + 1}, 执行时间: ${executionTime}ms`
+        );
+        this.logger.error(`🚨 错误详情: ${error.message || String(error)}`);
+        this.logger.error(
+          `🔍 错误类型: ${error.constructor.name}, 状态码: ${error.status || 'N/A'}`
+        );
 
         // 如果是可重试的错误且还有重试次数
         if (
@@ -321,17 +391,16 @@ export class LLM {
           attempt < this.retryConfig.maxRetries
         ) {
           this.logger.warn(
-            `Request failed with retryable error (attempt ${attempt + 1}), will retry: ${error.message || error}`
+            `🔄 可重试错误，准备重试 (attempt ${attempt + 1}/${this.retryConfig.maxRetries + 1}): ${error.message || error}`
           );
           continue;
         }
 
         // 如果不可重试或已达到最大重试次数，记录错误并抛出
-        const executionTime = Date.now() - startTime;
         await this.logTaskDetails(options, undefined, error, executionTime);
 
         this.logger.error(
-          `LLM request failed after ${attempt + 1} attempts: ${error.message || error}`
+          `💥 LLM请求最终失败，已尝试 ${attempt + 1} 次: ${error.message || error}`
         );
         throw error;
       }

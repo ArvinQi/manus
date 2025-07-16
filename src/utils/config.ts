@@ -10,7 +10,7 @@ import { fileURLToPath } from 'url';
 import { Logger } from './logger.js';
 import { MemoryConfig } from '../core/mem0_memory_manager.js';
 import { ConversationConfig } from '../core/conversation_context_manager.js';
-import { McpServiceConfig } from '../schema/multi_agent_config.js';
+import { McpServiceConfig, SimpleMcpServerConfig } from '../schema/multi_agent_config.js';
 import { A2AAgentConfig } from '../schema/multi_agent_config.js';
 
 // 获取项目根目录
@@ -75,7 +75,7 @@ interface UnifiedConfig {
   workspace?: {
     root: string;
   };
-  mcp_servers?: McpServiceConfig[];
+  mcpServers?: Record<string, SimpleMcpServerConfig>;
   a2a_agents?: A2AAgentConfig[];
 }
 
@@ -87,7 +87,7 @@ interface AppConfig {
   memory_config?: MemoryConfig;
   conversation_config?: ConversationConfig;
   workspace_root?: string;
-  mcp_servers?: McpServiceConfig[];
+  mcpServers?: Record<string, SimpleMcpServerConfig>;
   a2a_agents?: A2AAgentConfig[];
 }
 
@@ -235,7 +235,6 @@ export class Config {
     try {
       // 首先尝试加载统一配置文件
       const unifiedConfig = this.loadUnifiedConfig();
-
       if (unifiedConfig) {
         // 使用统一配置文件
         this.config = {
@@ -245,7 +244,7 @@ export class Config {
           memory_config: unifiedConfig.memory || this.getDefaultMemoryConfig(),
           conversation_config: unifiedConfig.conversation || this.getDefaultConversationConfig(),
           workspace_root: unifiedConfig.workspace?.root || WORKSPACE_ROOT,
-          mcp_servers: unifiedConfig.mcp_servers || [],
+          mcpServers: unifiedConfig.mcpServers || {},
           a2a_agents: unifiedConfig.a2a_agents || [],
         };
       } else {
@@ -258,7 +257,7 @@ export class Config {
           memory_config: this.getDefaultMemoryConfig(),
           conversation_config: this.getDefaultConversationConfig(),
           workspace_root: WORKSPACE_ROOT,
-          mcp_servers: [],
+          mcpServers: {},
           a2a_agents: [],
         };
 
@@ -388,8 +387,8 @@ export class Config {
   /**
    * 获取MCP服务器配置
    */
-  public getMcpServersConfig(): McpServiceConfig[] {
-    return this.config?.mcp_servers || [];
+  public getMcpServersConfig(): Record<string, SimpleMcpServerConfig> {
+    return this.config?.mcpServers || {};
   }
 
   /**
@@ -432,7 +431,7 @@ export class Config {
         workspace: {
           root: this.config.workspace_root || WORKSPACE_ROOT,
         },
-        mcp_servers: this.config.mcp_servers,
+        mcpServers: this.config.mcpServers,
         a2a_agents: this.config.a2a_agents,
       };
 

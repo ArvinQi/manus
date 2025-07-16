@@ -180,18 +180,18 @@ export abstract class BaseAgent {
       // 处理工具结果消息
       if (message.tool_call_id) {
         // 检查是否有对应的工具调用
-        if (!validToolCallIds.has(message.tool_call_id)) {
-          this.logger.warn(
-            `Removing orphaned tool result: ${message.tool_call_id} (no matching tool call)`
-          );
-          continue;
-        }
+        // if (!validToolCallIds.has(message.tool_call_id)) {
+        //   this.logger.warn(
+        //     `Removing orphaned tool result: ${message.tool_call_id} (no matching tool call)`
+        //   );
+        //   continue;
+        // }
 
         // 检查是否已经处理过
-        if (processedToolResults.has(message.tool_call_id)) {
-          this.logger.warn(`Removing duplicate tool result: ${message.tool_call_id}`);
-          continue;
-        }
+        // if (processedToolResults.has(message.tool_call_id)) {
+        //   this.logger.warn(`Removing duplicate tool result: ${message.tool_call_id}`);
+        //   continue;
+        // }
 
         processedToolResults.add(message.tool_call_id);
         result.push(message);
@@ -329,18 +329,105 @@ export abstract class BaseAgent {
         contextualMessages = allMessages;
       }
 
-      // 确保工具调用完整性
-      let processedMessages = this.ensureToolCallIntegrity(contextualMessages);
-      processedMessages = this.validateToolCallCompleteness(processedMessages);
+      // 验证工具调用完整性
+      // if (contextualMessages.length > 0) {
+      //   const validatedMessages = this.validateToolCallCompleteness(contextualMessages);
+      //   if (validatedMessages.length !== contextualMessages.length) {
+      //     this.logger.warn(`Final validation removed ${contextualMessages.length - validatedMessages.length} messages`);
+      //   }
+      //   contextualMessages = validatedMessages;
+      // }
+
+      // 添加额外的重复工具调用过滤
+      // contextualMessages = this.removeDuplicateToolCallsFromMessages(contextualMessages);
+
+      // if (contextualMessages[contextualMessages.length-1]?.content?.includes('请分析当前任务状态，思考下一步应该做什么，并使用适当的工具来完成任务。')){
+      //   contextualMessages.push(allMessages[allMessages.length - 1]);
+      // }
 
       this.logger.debug(
-        `Final contextual messages: ${processedMessages.length} (after tool call validation)`
+        `Final contextual messages: ${contextualMessages.length} (after tool call validation)`
       );
-      return processedMessages;
+      return contextualMessages;
     } catch (error) {
       this.logger.error(`Failed to get contextual messages: ${error}`);
       return this.memory.messages;
     }
+  }
+
+  /**
+   * 从消息中移除重复的工具调用
+   */
+  private removeDuplicateToolCallsFromMessages(messages: Message[]): Message[] {
+    const seenToolCalls = new Set<string>();
+    const seenToolResults = new Set<string>();
+    const filteredMessages: Message[] = [];
+
+    for (const message of messages) {
+      // 处理工具调用
+      if (message.tool_calls && message.tool_calls.length > 0) {
+        const uniqueToolCalls = message.tool_calls.filter((call) => {
+          const signature = `${call.function.name}:${JSON.stringify(call.function.arguments)}`;
+          if (seenToolCalls.has(signature)) {
+            this.logger.warn(`Removing duplicate tool call: ${call.id} (${call.function.name})`);
+            return false;
+          }
+          seenToolCalls.add(signature);
+          return true;
+        });
+
+        if (uniqueToolCalls.length > 0) {
+          const newMessage = { ...message, tool_calls: uniqueToolCalls };
+          filteredMessages.push(newMessage);
+        }
+      }
+      // 处理工具结果
+      else if (message.role === Role.TOOL && message.tool_call_id) {
+        if (seenToolResults.has(message.tool_call_id)) {
+          this.logger.warn(`Removing duplicate tool result: ${message.tool_call_id}`);
+          continue;
+        }
+        seenToolResults.add(message.tool_call_id);
+        filteredMessages.push(message);
+      }
+      // 其他消息直接保留
+      else {
+        filteredMessages.push(message);
+      }
+    }
+
+    // 验证工具调用和结果的配对
+    const toolCallIds = new Set<string>();
+    const toolResultIds = new Set<string>();
+
+    // 收集所有工具调用ID
+    for (const message of filteredMessages) {
+      if (message.tool_calls) {
+        for (const call of message.tool_calls) {
+          toolCallIds.add(call.id);
+        }
+      }
+    }
+
+    // 收集所有工具结果ID
+    for (const message of filteredMessages) {
+      if (message.role === Role.TOOL && message.tool_call_id) {
+        toolResultIds.add(message.tool_call_id);
+      }
+    }
+
+    // 检查是否有孤立的工具调用或结果
+    const orphanedToolCalls = Array.from(toolCallIds).filter((id) => !toolResultIds.has(id));
+    const orphanedToolResults = Array.from(toolResultIds).filter((id) => !toolCallIds.has(id));
+
+    if (orphanedToolCalls.length > 0) {
+      this.logger.warn(`Found orphaned tool calls: ${orphanedToolCalls.join(', ')}`);
+    }
+    if (orphanedToolResults.length > 0) {
+      this.logger.warn(`Found orphaned tool results: ${orphanedToolResults.join(', ')}`);
+    }
+
+    return filteredMessages;
   }
 
   /**
@@ -351,6 +438,14 @@ export abstract class BaseAgent {
     response: { content?: string | null; tool_calls?: any[]; usage?: any }
   ): Promise<void> {
     try {
+      // 只保存包含工具调用或重要内容的对话
+      const hasToolCalls = response.tool_calls && response.tool_calls.length > 0;
+      const hasImportantContent = response.content && response.content.length > 100;
+
+      if (!hasToolCalls && !hasImportantContent) {
+        return; // 跳过不重要的对话
+      }
+
       const conversationToSave = [...messages];
 
       // 添加助手的回复到对话记录
@@ -368,6 +463,8 @@ export abstract class BaseAgent {
         timestamp: new Date().toISOString(),
         agent: this.name,
         usage: response.usage,
+        hasToolCalls,
+        importance: hasToolCalls ? 0.9 : 0.7,
       };
 
       // 保存到 Mem0 记忆管理器
@@ -375,7 +472,9 @@ export abstract class BaseAgent {
         await this.memoryManager.addConversation(conversationToSave, metadata);
       }
 
-      this.logger.debug(`Saved ${conversationToSave.length} messages to memory systems`);
+      this.logger.debug(
+        `Saved important conversation (${conversationToSave.length} messages) to memory systems`
+      );
     } catch (error) {
       this.logger.error(`Failed to save conversation to memory: ${error}`);
     }
@@ -484,14 +583,14 @@ export abstract class BaseAgent {
     try {
       while (this.state === AgentState.RUNNING && this.currentStep < this.maxSteps) {
         this.currentStep++;
-        this.logger.info(`⚡ ${this.name} 执行第 ${this.currentStep} 步`);
+        this.logger.info(`⚡ ${this.name} 执行第 ${this.currentStep} / ${this.maxSteps} 步`);
 
         const stepResult = await this.step();
 
-        if (this.isStuck()) {
-          this.handleStuckState();
-          break;
-        }
+        // if (this.isStuck()) {
+        //   this.handleStuckState();
+        //   break;
+        // }
       }
 
       this.state = AgentState.FINISHED;

@@ -4,7 +4,7 @@
  */
 
 import { ReActAgent } from './react.js';
-import { AgentState, Message, ToolCall, ToolChoice } from '../schema/index.js';
+import { AgentState, Message, Role, ToolCall, ToolChoice } from '../schema/index.js';
 import { ToolCollection } from '../tool/tool_collection.js';
 import { Logger } from '../utils/logger.js';
 
@@ -313,10 +313,16 @@ export class ToolCallAgent extends ReActAgent {
       const currentQuery = this.extractCurrentQuery();
 
       // 添加调试日志来跟踪currentQuery的变化
-      this.logger.debug(`当前查询提取: "${currentQuery}"`);
+      this.logger.debug(`当前查询提取: "${currentQuery.slice(0, 100)}"`);
 
       // 使用Agent的智能上下文管理获取相关消息
       const contextualMessages = await this.getContextualMessages(currentQuery);
+
+      // 打印LLM调用前的信息
+      this.logger.info(`🤔 ${this.name} 开始思考过程`);
+      this.logger.info(`📚 上下文消息数量: ${contextualMessages.length}`);
+      this.logger.info(`🛠️ 可用工具数量: ${this.availableTools.toParams().length}`);
+      this.logger.info(`🎯 工具选择模式: ${this.toolChoice}`);
 
       // 获取带工具选项的响应
       const response = await this.llm.askTool({
@@ -422,6 +428,15 @@ export class ToolCallAgent extends ReActAgent {
       return this.messages[this.messages.length - 1].content || '没有内容或命令可执行';
     }
 
+    // 在开始执行前，先清理重复的工具调用
+    const uniqueToolCalls = this.removeDuplicateToolCalls(this.toolCalls);
+    if (uniqueToolCalls.length !== this.toolCalls.length) {
+      this.logger.warn(
+        `检测到重复工具调用，已移除 ${this.toolCalls.length - uniqueToolCalls.length} 个重复调用`
+      );
+      this.toolCalls = uniqueToolCalls;
+    }
+
     const results: string[] = [];
     for (const command of this.toolCalls) {
       // 检查是否已经处理过这个工具调用
@@ -429,6 +444,15 @@ export class ToolCallAgent extends ReActAgent {
         this.logger.warn(`Skipping already processed tool call: ${command.id}`);
         continue;
       }
+
+      // 检查是否在消息历史中已经执行过相同的工具调用
+      // if (this.isToolCallAlreadyExecuted(command)) {
+      //   this.logger.warn(
+      //     `Tool call already executed in history: ${command.id} (${command.function.name})`
+      //   );
+      //   this.processedToolCallIds.add(command.id);
+      //   continue;
+      // }
 
       // 重置每个工具调用的 base64 图像
       this._currentBase64Image = undefined;
@@ -445,7 +469,20 @@ export class ToolCallAgent extends ReActAgent {
         base64_image: this._currentBase64Image,
       });
 
+      this.logger.info(`💾 保存工具调用结果到内存: ${command.id} (${command.function.name})`);
       this.memory.addMessage(toolMsg);
+
+      // 验证工具调用结果是否正确保存
+      const savedMessages = this.memory.messages;
+      const toolResultExists = savedMessages.some(
+        (msg) => msg.tool_call_id === command.id && msg.role === Role.TOOL
+      );
+
+      if (!toolResultExists) {
+        this.logger.error(`❌ 工具调用结果未正确保存到内存: ${command.id}`);
+      } else {
+        this.logger.info(`✅ 工具调用结果已正确保存到内存: ${command.id}`);
+      }
 
       // 标记这个工具调用已被处理
       this.processedToolCallIds.add(command.id);
@@ -467,6 +504,49 @@ export class ToolCallAgent extends ReActAgent {
     // }
 
     return results.join('\n\n');
+  }
+
+  /**
+   * 移除重复的工具调用
+   * 基于工具名称和参数来判断是否重复
+   */
+  private removeDuplicateToolCalls(toolCalls: ToolCall[]): ToolCall[] {
+    const seen = new Set<string>();
+    const unique: ToolCall[] = [];
+
+    for (const call of toolCalls) {
+      // 创建工具调用的唯一标识
+      const signature = `${call.function.name}:${call.function.arguments}`;
+
+      if (!seen.has(signature)) {
+        seen.add(signature);
+        unique.push(call);
+      } else {
+        this.logger.warn(`Removing duplicate tool call: ${call.function.name} with same arguments`);
+      }
+    }
+
+    return unique;
+  }
+
+  /**
+   * 检查工具调用是否已经在消息历史中执行过
+   */
+  private isToolCallAlreadyExecuted(command: ToolCall): boolean {
+    // 检查消息历史中是否已经有相同的工具调用结果
+    for (const message of this.messages) {
+      if (message.tool_call_id === command.id) {
+        return true;
+      }
+
+      // 检查是否有相同工具名称和参数的工具结果
+      if (message.name === command.function.name && message.content) {
+        // 这里可以添加更复杂的参数比较逻辑
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**

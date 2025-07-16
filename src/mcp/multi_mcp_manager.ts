@@ -8,7 +8,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { spawn, ChildProcess } from 'child_process';
 import { Logger } from '../utils/logger.js';
-import { McpServiceConfig } from '../schema/multi_agent_config.js';
+import { McpServiceConfig, SimpleMcpServerConfig } from '../schema/multi_agent_config.js';
 import { EventEmitter } from 'events';
 
 // 导入系统内置工具
@@ -70,16 +70,24 @@ export class MultiMcpManager extends EventEmitter {
   }
 
   /**
-   * 初始化所有MCP服务
+   * 初始化所有MCP服务 (只支持新格式)
    */
-  async initialize(configs: McpServiceConfig[]): Promise<void> {
-    this.logger.info(`初始化 ${configs.length} 个MCP服务`);
+  async initialize(
+    configs?: Record<string, SimpleMcpServerConfig>
+  ): Promise<void> {
+    if (!configs) {
+      this.logger.warn('未提供MCP服务配置，跳过初始化');
+      return;
+    }
+
+    const normalizedConfigs = this.convertNewFormatToOldFormat(configs);
+    this.logger.info(`初始化 ${normalizedConfigs.length} 个MCP服务`);
 
     // 首先初始化系统内置工具服务
     await this.initializeSystemTools();
 
     // 并行初始化所有服务
-    const initPromises = configs.map((config) => this.initializeService(config));
+    const initPromises = normalizedConfigs.map((config) => this.initializeService(config));
     const results = await Promise.allSettled(initPromises);
 
     // 统计初始化结果
@@ -91,7 +99,29 @@ export class MultiMcpManager extends EventEmitter {
     // 启动健康检查
     this.startHealthCheck();
 
-    this.emit('initialized', { successful, failed, total: configs.length + 1 }); // +1 for system tools
+    this.emit('initialized', { successful, failed, total: normalizedConfigs.length + 1 }); // +1 for system tools
+  }
+
+  /**
+   * 将新格式配置转换为旧格式配置
+   */
+  private convertNewFormatToOldFormat(
+    newFormat: Record<string, SimpleMcpServerConfig>
+  ): McpServiceConfig[] {
+    return Object.entries(newFormat).map(([name, config]) => ({
+      name,
+      type: config.type || 'stdio',
+      command: config.command,
+      args: config.args,
+      url: config.url,
+      capabilities: config.capabilities || [],
+      priority: config.priority || 1,
+      enabled: config.enabled !== false, // 默认启用
+      timeout: config.timeout || 30000,
+      retry_count: config.retry_count || 3,
+      health_check_interval: 60000, // 固定值
+      metadata: config.metadata || {}
+    }));
   }
 
   /**
@@ -106,12 +136,12 @@ export class MultiMcpManager extends EventEmitter {
 
       // 初始化所有系统工具
       systemTools.set('bash', new BashTool());
-      systemTools.set('ask_human', new AskHumanTool());
-      systemTools.set('create_chat_completion', new CreateChatCompletionTool());
-      systemTools.set('file_operators', new FileOperatorsTool());
+      // systemTools.set('ask_human', new AskHumanTool());
+      // systemTools.set('create_chat_completion', new CreateChatCompletionTool());
+      // systemTools.set('file_operators', new FileOperatorsTool());
       systemTools.set('planning', new PlanningTool());
       systemTools.set('str_replace_editor', new StrReplaceEditorTool());
-      systemTools.set('system_info', new SystemInfoTool());
+      // systemTools.set('system_info', new SystemInfoTool());
       systemTools.set('terminate', new Terminate());
 
       // 创建系统工具的MCP服务实例
@@ -121,10 +151,10 @@ export class MultiMcpManager extends EventEmitter {
         enabled: true,
         capabilities: [
           'bash',
-          'file_operations',
+          // 'file_operations',
           'planning',
-          'chat_completion',
-          'system_info',
+          // 'chat_completion',
+          // 'system_info',
           'process_control',
         ],
         priority: 1,

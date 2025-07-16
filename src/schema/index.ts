@@ -146,9 +146,11 @@ export class Memory {
         return; // 跳过重复的工具结果
       }
       this.addedToolResults.add(message.tool_call_id);
+      console.log(`✅ 添加工具结果到内存: ${message.tool_call_id} (${message.name})`);
     }
 
     this.messages.push(message);
+    console.log(`📝 消息已添加到内存，当前消息数量: ${this.messages.length}`);
   }
 
   /**

@@ -1,6 +1,6 @@
 {
-  "name": "@manus/cli",
-  "version": "1.0.0",
+  "name": "@ctrip/manus-core",
+  "version": "1.0.1",
   "description": "A TypeScript implementation of the Manus agent framework",
   "type": "module",
   "main": "dist/index.js",
@@ -31,8 +31,8 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@anthropic-ai/claude-code": "^1.0.53",
     "@modelcontextprotocol/sdk": "^1.11.1",
-    "@qdrant/js-client-rest": "^1.14.1",
     "app": "^0.1.0",
     "axios": "^1.6.7",
     "chromadb": "^3.0.9",

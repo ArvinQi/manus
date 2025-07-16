@@ -9,7 +9,7 @@ import { TaskManagementConfig } from '../schema/multi_agent_config.js';
 import { Task, DecisionResult, DecisionEngine } from './decision_engine.js';
 import { MultiMcpManager } from '../mcp/multi_mcp_manager.js';
 import { A2AAgentManager } from '../agent/a2a_agent_manager.js';
-import { MemoryManager } from './memory_manager.js';
+import { Mem0MemoryManager } from './mem0_memory_manager.js';
 
 // 任务状态
 export enum TaskStatus {
@@ -74,7 +74,7 @@ export class TaskManager extends EventEmitter {
   private decisionEngine: DecisionEngine;
   private mcpManager: MultiMcpManager;
   private agentManager: A2AAgentManager;
-  private memoryManager: MemoryManager;
+  private memoryManager?: Mem0MemoryManager;
 
   // 任务队列和状态管理
   private taskQueue: TaskQueueItem[] = [];
@@ -105,7 +105,7 @@ export class TaskManager extends EventEmitter {
     decisionEngine: DecisionEngine,
     mcpManager: MultiMcpManager,
     agentManager: A2AAgentManager,
-    memoryManager: MemoryManager
+    memoryManager?: Mem0MemoryManager
   ) {
     super();
     this.logger = new Logger('TaskManager');
@@ -625,7 +625,10 @@ export class TaskManager extends EventEmitter {
     runningTask.lastCheckpoint = checkpoint;
 
     // 持久化检查点
-    await this.memoryManager.saveCheckpoint(runningTask.task.id, checkpoint);
+    await this.memoryManager?.saveCheckpoint(runningTask.task.id, {
+      ...checkpoint,
+      taskId: runningTask.task.id,
+    });
   }
 
   /**
@@ -635,12 +638,12 @@ export class TaskManager extends EventEmitter {
     this.logger.info('恢复未完成的任务');
 
     try {
-      const checkpoints = await this.memoryManager.getCheckpoints();
+      const checkpoints = await this.memoryManager?.getCheckpoints();
 
-      for (const checkpoint of checkpoints) {
+      for (const checkpoint of checkpoints || []) {
         if (checkpoint.canResume) {
           // 重新提交任务
-          const task = await this.memoryManager.getTaskById(checkpoint.id.split('_')[0]);
+          const task = await this.memoryManager?.getTaskById(checkpoint.id.split('_')[0]);
           if (task) {
             await this.submitTask(task);
           }

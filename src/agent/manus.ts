@@ -20,7 +20,7 @@ import {
   ConversationContextManager,
   ConversationConfig,
 } from '../core/conversation_context_manager.js';
-import { Message, Role } from '../schema/index.js';
+import { Message, Role, AgentState } from '../schema/index.js';
 import { PlanManager, Plan, PlanStep, StepStatus as PlanStepStatus } from '../core/plan_manager.js';
 
 // 系统提示词
@@ -729,6 +729,47 @@ class TaskManager {
   }
 }
 
+
+
+  /**
+   * 备份现有的.manus目录
+   * 如果.manus目录存在，将其重命名为.manus_backup_[timestamp]
+   */
+  function backupManusDirectory(): void {
+    try {
+      const workspaceRoot = config.getWorkspaceRoot();
+      const manusDir = path.join(workspaceRoot, '.manus');
+
+      // 检查.manus目录是否存在
+      if (!fs.existsSync(manusDir)) {
+        console.log('.manus目录不存在，无需备份');
+        return;
+      }
+
+      // 生成备份目录名称（使用本地时间，方便阅读）
+      const now = new Date();
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const day = String(now.getDate()).padStart(2, '0');
+      const hour = String(now.getHours()).padStart(2, '0');
+      const minute = String(now.getMinutes()).padStart(2, '0');
+      const second = String(now.getSeconds()).padStart(2, '0');
+
+      const timestamp = `${year}-${month}-${day}_${hour}-${minute}-${second}`;
+      const backupDir = path.join(workspaceRoot, `.manus_backup_${timestamp}`);
+
+      // 重命名目录进行备份
+      fs.renameSync(manusDir, backupDir);
+      console.log(`已备份.manus目录到: ${path.basename(backupDir)}`);
+
+      // 清理旧的备份（保留最近10个备份）
+      // this.cleanupOldBackups(workspaceRoot);
+    } catch (error) {
+      console.error(`备份.manus目录失败: ${(error as Error).message}`);
+      // 备份失败不应该阻止任务创建，继续执行
+    }
+  }
+
 /**
  * Manus 类 - 重构版本
  * 一个多功能的通用代理，支持多种工具
@@ -779,10 +820,14 @@ export class Manus extends ToolCallAgent {
       llmConfigName?: string;
       tools?: ToolCollection;
       useMcpServer?: boolean;
-      multiAgentSystem?: MultiAgentSystem;
       continueTask?: boolean;
     } = {}
   ) {
+    // 如果不是继续任务模式，先备份现有的.manus目录
+    if (!options.continueTask) {
+      backupManusDirectory();
+    }
+
     super({
       name: options.name || 'Manus',
       description: options.description || '一个多功能的通用代理，支持任务持久化和继续执行',
@@ -795,11 +840,6 @@ export class Manus extends ToolCallAgent {
       toolChoice: ToolChoice.AUTO,
       specialToolNames: ['Terminate'],
     });
-
-    // 如果不是继续任务模式，先备份现有的.manus目录
-    if (!options.continueTask) {
-      this.backupManusDirectory();
-    }
 
     // 初始化任务管理器
     this.taskManager = new TaskManager(config.getWorkspaceRoot());
@@ -823,10 +863,74 @@ export class Manus extends ToolCallAgent {
     };
     this.conversationContextManager = new ConversationContextManager(conversationConfig);
 
-    // 设置多智能体系统
-    if (options.multiAgentSystem) {
-      this.multiAgentSystem = options.multiAgentSystem;
+    // 默认初始化多智能体系统
+    this.initializeMultiAgentSystem();
+  }
+
+  /**
+   * 初始化多智能体系统
+   */
+  private initializeMultiAgentSystem(): void {
+    try {
+      // 从配置中获取多智能体系统配置
+      const mcpServers = config.getMcpServersConfig();
+      const agentConfig = config.getAgentsConfig();
+
+      // 获取Mem0记忆配置并转换为多智能体系统格式
+      const mem0Config = config.getMemoryConfig();
+      const multiAgentMemoryConfig = {
+        provider: 'openmemory' as const,
+        openmemory: {
+          mcp_name: 'openmemory',
+          compression_threshold: mem0Config.compressionThreshold || 1000,
+          extraction_interval: 3600000,
+          retention_policy: {
+            max_messages: mem0Config.maxContextMessages * 400 || 10000, // 基于上下文消息数计算
+            max_age_days: 30,
+            importance_threshold: mem0Config.searchThreshold || 0.5,
+          },
+        },
+      };
+
+      // 创建多智能体系统配置
+      const multiAgentConfig = {
+        mcpServers,
+        a2a_agents: agentConfig,
+        routing_rules: [],
+        memory_config: multiAgentMemoryConfig,
+        task_management: {
+          max_concurrent_tasks: 5,
+          task_timeout: 300000,
+          priority_queue_size: 100,
+          interruption_policy: 'at_checkpoint' as const,
+          checkpoint_interval: 30000,
+          task_persistence: true,
+          auto_recovery: true,
+        },
+        decision_engine: {
+          strategy: 'rule_based' as const,
+          confidence_threshold: 0.7,
+          fallback_strategy: 'local' as const,
+          learning_enabled: false,
+          metrics_collection: true,
+        },
+        system: {
+          name: 'Manus-MultiAgent',
+          version: '2.0.0',
+          debug_mode: false,
+          log_level: 'info' as const,
+        },
+      };
+
+      // 创建多智能体系统，传入继承自 base 的 memoryManager
+      this.multiAgentSystem = new MultiAgentSystem(multiAgentConfig, this.memoryManager);
+      this.logger.info('多智能体系统已初始化');
+
+      // 设置工具路由器
       this.setupToolRouter();
+    } catch (error) {
+      this.logger.error('多智能体系统初始化失败:', error);
+      // 不抛出错误，让代理继续运行
     }
   }
 
@@ -848,45 +952,6 @@ export class Manus extends ToolCallAgent {
       retryCount: 3,
       fallbackEnabled: true,
     });
-  }
-
-  /**
-   * 备份现有的.manus目录
-   * 如果.manus目录存在，将其重命名为.manus_backup_[timestamp]
-   */
-  private backupManusDirectory(): void {
-    try {
-      const workspaceRoot = config.getWorkspaceRoot();
-      const manusDir = path.join(workspaceRoot, '.manus');
-
-      // 检查.manus目录是否存在
-      if (!fs.existsSync(manusDir)) {
-        console.log('.manus目录不存在，无需备份');
-        return;
-      }
-
-      // 生成备份目录名称（使用本地时间，方便阅读）
-      const now = new Date();
-      const year = now.getFullYear();
-      const month = String(now.getMonth() + 1).padStart(2, '0');
-      const day = String(now.getDate()).padStart(2, '0');
-      const hour = String(now.getHours()).padStart(2, '0');
-      const minute = String(now.getMinutes()).padStart(2, '0');
-      const second = String(now.getSeconds()).padStart(2, '0');
-
-      const timestamp = `${year}-${month}-${day}_${hour}-${minute}-${second}`;
-      const backupDir = path.join(workspaceRoot, `.manus_backup_${timestamp}`);
-
-      // 重命名目录进行备份
-      fs.renameSync(manusDir, backupDir);
-      console.log(`已备份.manus目录到: ${path.basename(backupDir)}`);
-
-      // 清理旧的备份（保留最近10个备份）
-      this.cleanupOldBackups(workspaceRoot);
-    } catch (error) {
-      console.error(`备份.manus目录失败: ${(error as Error).message}`);
-      // 备份失败不应该阻止任务创建，继续执行
-    }
   }
 
   /**
@@ -942,8 +1007,6 @@ export class Manus extends ToolCallAgent {
       tools?: ToolCollection;
       useMcpServer?: boolean;
       continueTask?: boolean;
-      multiAgentSystem?: MultiAgentSystem;
-      enableMultiAgent?: boolean;
     } = {}
   ): Promise<Manus> {
     const instance = new Manus(options);
@@ -958,6 +1021,17 @@ export class Manus extends ToolCallAgent {
     useMcpServer: boolean = false,
     continueTask: boolean = false
   ): Promise<void> {
+    // 启动多智能体系统
+    if (this.multiAgentSystem) {
+      try {
+        await this.multiAgentSystem.start();
+        this.logger.info('多智能体系统已启动');
+      } catch (error) {
+        this.logger.error('多智能体系统启动失败:', error);
+        // 不抛出错误，让代理继续运行
+      }
+    }
+
     // 尝试加载或恢复任务
     if (continueTask) {
       const recentTask = this.taskManager.getRecentTask();
@@ -1057,75 +1131,305 @@ export class Manus extends ToolCallAgent {
   }
 
   /**
-   * 思考过程 - 重构版本
+   * 从多智能体系统获取工具参数
    */
-  async think(): Promise<boolean> {
-    if (!this._initialized) {
-      await this.initialize();
+  private async getToolsFromMultiAgentSystem(): Promise<any[]> {
+    if (!this.multiAgentSystem) {
+      this.logger.debug('MultiAgentSystem not available, falling back to traditional tools');
+      return this.availableTools.toParams();
     }
-
-    // 记录用户消息到对话上下文
-    await this.recordConversationContext();
-
-    // 检查当前任务状态
-    const currentTask = this.taskManager.getCurrentTask();
-    if (!currentTask) {
-      // 没有任务时使用原有逻辑
-      const result = await super.think();
-
-      // 记录助手响应到对话上下文
-      await this.recordAssistantResponse();
-
-      return result;
-    }
-
-    // 构建包含对话上下文的任务感知提示词
-    const originalPrompt = this.nextStepPrompt;
-    this.nextStepPrompt = await this.buildTaskAwarePromptWithContext(currentTask);
 
     try {
-      // 开始或继续当前步骤
-      const currentStep = this.taskManager.getCurrentStep();
-      if (currentStep && currentStep.status === StepStatus.PENDING) {
-        this.taskManager.startCurrentStep();
+      const tools: any[] = [];
+
+      // 获取MCP工具
+      const mcpTools = this.multiAgentSystem.getMcpManager().getAllAvailableTools();
+      for (const mcpTool of mcpTools) {
+        const tool = mcpTool.tool;
+        tools.push({
+          type: 'function',
+          function: {
+            name: tool.name,
+            description: tool.description || `MCP工具来自服务: ${mcpTool.serviceName}`,
+            parameters: tool.inputSchema || {
+              type: 'object',
+              properties: {},
+              required: [],
+            },
+          },
+          metadata: {
+            source: 'mcp',
+            serviceName: mcpTool.serviceName,
+          },
+        });
       }
 
-      // 执行思考过程
-      const result = await super.think();
-
-      // 记录助手响应到对话上下文
-      await this.recordAssistantResponse();
-
-      // 处理执行结果
-      if (result && currentStep) {
-        this.taskManager.completeCurrentStep();
-        this.executionStats.successfulSteps++;
-      } else if (currentStep) {
-        const shouldRetry = this.taskManager.failCurrentStep('步骤执行失败');
-        if (shouldRetry) {
-          this.executionStats.retriedSteps++;
-        } else {
-          this.executionStats.failedSteps++;
-        }
+      // 获取A2A代理工具（转换为虚拟工具）
+      const a2aAgents = await this.multiAgentSystem.getAgentManager().getAvailableAgents();
+      for (const agent of a2aAgents) {
+        // 为每个A2A代理创建一个通用工具
+        tools.push({
+          type: 'function',
+          function: {
+            name: `call_agent_${agent.config.name}`,
+            description: `调用A2A代理: ${agent.config.name}. 能力: ${agent.capabilities.join(', ')}`,
+            parameters: {
+              type: 'object',
+              properties: {
+                request: {
+                  type: 'string',
+                  description: '要发送给代理的请求',
+                },
+                context: {
+                  type: 'object',
+                  description: '额外的上下文信息',
+                  properties: {},
+                },
+              },
+              required: ['request'],
+            },
+          },
+          metadata: {
+            source: 'a2a',
+            agentName: agent.config.name,
+            capabilities: agent.capabilities,
+          },
+        });
       }
 
-      this.executionStats.totalSteps++;
-      this.updateExecutionStats();
+      this.logger.info(
+        `从MultiAgentSystem获取到 ${tools.length} 个工具 (${mcpTools.length} MCP + ${a2aAgents.length} A2A)`
+      );
 
-      return result;
+      // 如果没有工具，回退到传统工具
+      if (tools.length === 0) {
+        this.logger.warn('MultiAgentSystem没有可用工具，回退到传统工具');
+        return this.availableTools.toParams();
+      }
+
+      return tools;
     } catch (error) {
-      this.logger.error(`思考过程出错: ${(error as Error).message}`);
+      this.logger.error(`从MultiAgentSystem获取工具失败: ${error}`);
+      this.logger.info('回退到传统工具');
+      return this.availableTools.toParams();
+    }
+  }
 
-      const currentStep = this.taskManager.getCurrentStep();
-      if (currentStep) {
-        this.taskManager.failCurrentStep((error as Error).message);
-        this.executionStats.failedSteps++;
+  /**
+   * 多智能体思考过程
+   */
+  async think(): Promise<boolean> {
+    this.logger.info(`🤔 Manus 开始多智能体思考过程`);
+
+    // 如果有下一步提示，添加用户消息
+    if (this.nextStepPrompt) {
+      const userMsg = Message.userMessage(this.nextStepPrompt);
+      this.messages.push(userMsg);
+    }
+
+    // 检查是否陷入循环
+    // const recentMessages = this.memory.messages.slice(-10);
+    // const recentToolCalls = recentMessages.filter(
+    //   (msg) => msg.tool_calls && msg.tool_calls.length > 0
+    // );
+
+    // if (recentToolCalls.length >= 3) {
+    //   // 检查最近3次工具调用是否相同
+    //   const lastThreeToolCalls = recentToolCalls.slice(-3);
+    //   const toolCallSignatures = lastThreeToolCalls.map((msg) =>
+    //     msg.tool_calls?.map((call) => `${call.function.name}:${call.function.arguments}`).join(',')
+    //   );
+
+    //   if (
+    //     toolCallSignatures.length === 3 &&
+    //     toolCallSignatures[0] === toolCallSignatures[1] &&
+    //     toolCallSignatures[1] === toolCallSignatures[2]
+    //   ) {
+    //     this.logger.warn(`⚠️ Manus 可能陷入循环，停止执行`);
+    //     this.state = AgentState.FINISHED;
+    //     return false;
+    //   }
+    // }
+
+    const contextualMessages = await this.getContextualMessages();
+    this.logger.info(`📚 上下文消息数量: ${contextualMessages.length}`);
+
+    const tools = await this.getToolsFromMultiAgentSystem();
+    this.logger.info(`🛠️ 多智能体工具数量: ${tools.length}`);
+
+    const toolChoice = this.toolChoice;
+    this.logger.info(`🎯 工具选择模式: ${toolChoice}`);
+
+    const currentQuery = this.extractCurrentQuery();
+    this.logger.info(`🔍 当前查询: ${currentQuery.slice(0, 100)}`);
+
+    const response = await this.llm.askTool({
+      messages: contextualMessages,
+      // messages: contextualMessages.map((it) => {
+      //   if (it.content && it.tool_call_id) {
+      //     it.content = [
+      //       {
+      //         toolResult: {
+      //           content: [{ text: it.content }],
+      //           toolUseId: it.tool_call_id,
+      //           status: 'success',
+      //         },
+      //       },
+      //       {
+      //         text: '基于以上结果，请继续思考下一步',
+      //       },
+      //     ] as any;
+      //     // it.content.replace(/<tool_result id="[^"]*">[\s\S]*<\/tool_result>/g, '');
+      //   }
+      //   return it;
+      // }),
+      systemMsgs: this.systemPrompt ? [Message.systemMessage(this.systemPrompt)] : undefined,
+      tools: tools,
+      toolChoice: toolChoice,
+      currentQuery: currentQuery,
+    });
+
+    if (response.tool_calls && response.tool_calls.length > 0) {
+      this.toolCalls = response.tool_calls;
+      this.logger.info(`🛠️ Manus 选择了 ${this.toolCalls.length} 个工具使用`);
+
+      const toolNames = this.toolCalls.map((call) => call.function.name);
+      this.logger.info(`🧰 准备使用的工具: ${toolNames.join(', ')}`);
+
+      // 记录工具参数用于调试
+      this.toolCalls.forEach((call, index) => {
+        this.logger.info(`🔧 工具参数: ${JSON.stringify(call.function.arguments)}`);
+      });
+    } else {
+      this.toolCalls = [];
+      this.logger.info(`✨ Manus 的思考: ${response.content}`);
+    }
+
+    return true;
+  }
+
+  /**
+   * 使用 MultiAgentSystem 工具进行思考
+   */
+  private async thinkWithMultiAgentTools(): Promise<boolean> {
+    // 如果有下一步提示，添加用户消息
+    if (this.nextStepPrompt) {
+      const userMsg = Message.userMessage(this.nextStepPrompt);
+      this.messages.push(userMsg);
+    }
+
+    try {
+      // 获取当前查询用于上下文获取
+      const currentQuery = this.extractCurrentQuery();
+
+      // 使用Agent的智能上下文管理获取相关消息
+      const contextualMessages = await this.getContextualMessages(currentQuery);
+
+      // 获取来自 MultiAgentSystem 的工具
+      const multiAgentTools = await this.getToolsFromMultiAgentSystem();
+
+      // 打印LLM调用前的信息
+      this.logger.info(`🤔 ${this.name} 开始多智能体思考过程`);
+      this.logger.info(`📚 上下文消息数量: ${contextualMessages.length}`);
+      this.logger.info(`🛠️ 多智能体工具数量: ${multiAgentTools.length}`);
+      this.logger.info(`🎯 工具选择模式: ${this.toolChoice}`);
+      this.logger.info(`🔍 当前查询: ${currentQuery.slice(0, 100)}`);
+
+      // 获取带工具选项的响应
+      const response = await this.llm.askTool({
+        messages: contextualMessages.map((it) => {
+          if (it.content) {
+            it.content = JSON.stringify([
+              {
+                toolResult: {
+                  content: [{ text: it.content }],
+                  toolUseId: it.tool_call_id,
+                  status: 'success',
+                },
+              },
+              {
+                text: '基于以上结果，请继续思考下一步',
+              },
+            ]);
+            // it.content.replace(/<tool_result id="[^"]*">[\s\S]*<\/tool_result>/g, '');
+          }
+          return it;
+        }),
+        systemMsgs: this.systemPrompt ? [Message.systemMessage(this.systemPrompt)] : undefined,
+        tools: multiAgentTools,
+        toolChoice: this.toolChoice,
+        currentQuery: currentQuery,
+      });
+
+      // 保存对话到记忆系统
+      await this.saveConversationToMemory(contextualMessages, response);
+
+      // 保存工具调用
+      this.toolCalls = response.tool_calls || [];
+      const content = response.content || '';
+
+      // 记录响应信息
+      this.logger.info(`✨ ${this.name} 的思考: ${content}`);
+      this.logger.info(`🛠️ ${this.name} 选择了 ${this.toolCalls.length || 0} 个工具使用`);
+
+      if (this.toolCalls.length > 0) {
+        this.logger.info(
+          `🧰 准备使用的工具: ${this.toolCalls.map((call) => call.function.name).join(', ')}`
+        );
+        this.logger.info(`🔧 工具参数: ${this.toolCalls[0].function.arguments}`);
       }
 
-      return false;
-    } finally {
-      // 恢复原始提示词
-      this.nextStepPrompt = originalPrompt;
+      try {
+        if (!response) {
+          throw new Error('未从 LLM 收到响应');
+        }
+
+        // 处理不同的工具选择模式
+        if (this.toolChoice === ToolChoice.NONE) {
+          if (this.toolCalls.length > 0) {
+            this.logger.warn(`🤔 嗯，${this.name} 尝试使用不可用的工具！`);
+          }
+          if (content) {
+            this.memory.addMessage(Message.assistantMessage(content));
+            return true;
+          }
+          return false;
+        }
+
+        // 创建并添加助手消息
+        const assistantMsg =
+          this.toolCalls.length > 0
+            ? Message.fromToolCalls({ content, tool_calls: this.toolCalls })
+            : Message.assistantMessage(content);
+
+        this.memory.addMessage(assistantMsg);
+
+        if (this.toolChoice === ToolChoice.REQUIRED && this.toolCalls.length === 0) {
+          return true; // 将在 act() 中处理
+        }
+
+        // 对于 'auto' 模式，如果没有命令但有内容，则继续
+        if (this.toolChoice === ToolChoice.AUTO && this.toolCalls.length === 0) {
+          return !!content;
+        }
+
+        return this.toolCalls.length > 0;
+      } catch (error) {
+        this.logger.error(`🚨 糟糕！${this.name} 的思考过程遇到了问题: ${error}`);
+        this.memory.addMessage(Message.assistantMessage(`处理时遇到错误: ${error}`));
+        return false;
+      }
+    } catch (error) {
+      // 检查是否是令牌限制错误
+      if (error instanceof Error && error.message.includes('token limit')) {
+        this.logger.error(`🚨 令牌限制错误: ${error}`);
+        this.memory.addMessage(
+          Message.assistantMessage(`达到最大令牌限制，无法继续执行: ${error}`)
+        );
+        this.state = AgentState.FINISHED;
+        return false;
+      }
+      throw error;
     }
   }
 
@@ -1232,20 +1536,25 @@ export class Manus extends ToolCallAgent {
    */
   private async recordConversationContext(): Promise<void> {
     try {
-      // 获取最近的用户消息
-      const recentMessages = this.memory.messages.slice(-5);
+      // 获取最近的用户消息，但减少记录频率
+      const recentMessages = this.memory.messages.slice(-3); // 从5条减少到3条
       const userMessages = recentMessages.filter((msg) => msg.role === 'user');
 
-      for (const userMsg of userMessages) {
+      // 只记录最后一条用户消息，避免重复记录
+      if (userMessages.length > 0) {
+        const lastUserMessage = userMessages[userMessages.length - 1];
         const message: Message = {
           role: 'user' as Role,
-          content: userMsg.content || '',
+          content: lastUserMessage.content || '',
         };
 
         // 检查是否为任务创建或重要消息
         const metadata = this.extractMessageMetadata(message);
 
-        await this.conversationContextManager.addMessage(message, metadata);
+        // 只记录重要消息
+        if (metadata.importance > 0.7) {
+          await this.conversationContextManager.addMessage(message, metadata);
+        }
       }
     } catch (error) {
       this.logger.warn(`记录用户消息上下文失败: ${(error as Error).message}`);
@@ -1350,7 +1659,18 @@ export class Manus extends ToolCallAgent {
     try {
       let result: any;
 
-      if (this.toolRouter) {
+      // 检查是否为 MultiAgentSystem 工具调用
+      if (this.multiAgentSystem && typeof commandOrName !== 'string') {
+        const toolName = commandOrName.function.name;
+
+        // 检查是否为 A2A 代理工具调用
+        if (toolName.startsWith('call_agent_')) {
+          result = await this.executeA2AToolCall(commandOrName);
+        } else {
+          // 尝试通过 MCP 或 ToolRouter 执行
+          result = await this.executeMultiAgentToolCall(commandOrName);
+        }
+      } else if (this.toolRouter) {
         result = await this.executeToolCallWithRouter(commandOrName, args);
       } else {
         result = await super.executeToolCall(commandOrName, args);
@@ -1366,6 +1686,99 @@ export class Manus extends ToolCallAgent {
       const duration = Date.now() - startTime;
       this.recordToolExecution(commandOrName, false, duration, (error as Error).message);
 
+      throw error;
+    }
+  }
+
+  /**
+   * 执行 A2A 代理工具调用
+   */
+  private async executeA2AToolCall(command: ToolCall): Promise<string> {
+    const toolName = command.function.name;
+    const agentName = toolName.replace('call_agent_', '');
+
+    try {
+      const toolArgs = JSON.parse(command.function.arguments || '{}');
+      const request = toolArgs.request;
+      const context = toolArgs.context || {};
+
+      this.logger.info(`🤖 调用A2A代理: ${agentName} - ${request}`);
+
+      const result = await this.multiAgentSystem!.getAgentManager().executeTask(agentName, {
+        taskId: `task_${Date.now()}`,
+        taskType: 'general',
+        description: request,
+        parameters: context,
+        priority: 'medium',
+        timeout: 60000,
+        requiredCapabilities: [],
+        context: context,
+      });
+
+      return `A2A代理 \`${agentName}\` 执行完成:\n${this.formatToolResult(result)}`;
+    } catch (error) {
+      this.logger.error(`A2A代理调用失败: ${error}`);
+      throw new Error(`A2A代理 ${agentName} 执行失败: ${error}`);
+    }
+  }
+
+  /**
+   * 执行 MultiAgentSystem 工具调用
+   */
+  private async executeMultiAgentToolCall(command: ToolCall): Promise<string> {
+    const toolName = command.function.name;
+
+    try {
+      const toolArgs = JSON.parse(command.function.arguments || '{}');
+
+      this.logger.info(`🔧 通过MultiAgentSystem执行工具: ${toolName}`);
+
+      // 首先尝试通过 MCP 服务查找工具
+      const mcpTools = this.multiAgentSystem!.getMcpManager().getAllAvailableTools();
+      const mcpTool = mcpTools.find((t) => t.tool.name === toolName);
+
+      if (mcpTool) {
+        this.logger.debug(`在MCP服务 ${mcpTool.serviceName} 中找到工具: ${toolName}`);
+        const result = await this.multiAgentSystem!.getMcpManager().callTool(
+          mcpTool.serviceName,
+          toolName,
+          toolArgs
+        );
+
+        return `MCP工具 \`${toolName}\` 执行完成 (服务: ${mcpTool.serviceName}):\n${this.formatToolResult(result)}`;
+      }
+
+      // 如果在 MCP 中没找到，尝试通过 ToolRouter
+      if (this.toolRouter) {
+        const currentTask = this.taskManager.getCurrentTask();
+        const toolRequest = {
+          name: toolName,
+          arguments: toolArgs,
+          context: {
+            task: currentTask?.title || 'default_task',
+            step: currentTask?.currentStepIndex ?? -1,
+          },
+        };
+
+        const routerResult = await this.toolRouter.executeToolCall(toolRequest);
+
+        if (!routerResult.success) {
+          throw new Error(routerResult.error || '工具路由执行失败');
+        }
+
+        return `工具 \`${toolName}\` 执行完成 (由 ${routerResult.executedBy} 执行):\n${this.formatToolResult(routerResult.result)}`;
+      }
+
+      // 如果都没找到，回退到传统工具
+      this.logger.warn(`MultiAgentSystem中未找到工具 ${toolName}，回退到传统工具`);
+      if (this.availableTools.toolMap[toolName]) {
+        const result = await this.availableTools.execute(toolName, toolArgs);
+        return `传统工具 \`${toolName}\` 执行完成:\n${this.formatToolResult(result)}`;
+      }
+
+      throw new Error(`未找到工具: ${toolName}`);
+    } catch (error) {
+      this.logger.error(`MultiAgentSystem工具调用失败: ${error}`);
       throw error;
     }
   }
