@@ -1221,6 +1221,20 @@ export class Manus extends ToolCallAgent {
   async think(): Promise<boolean> {
     this.logger.info(`🤔 Manus 开始多智能体思考过程`);
 
+    const currentPlan = this.planManager.getCurrentPlan();
+
+    // 更新系统提示词，包含任务和计划信息
+    const currentTask = this.taskManager.getCurrentTask();
+    if (currentTask) {
+      try {
+        const planPrompt = await this.buildTaskAwarePromptWithContext(currentTask);
+        this.systemPrompt = this.systemPrompt + '\n' + planPrompt;
+        this.logger.info('已更新系统提示词，包含任务和计划信息');
+      } catch (error) {
+        this.logger.warn(`更新系统提示词失败: ${(error as Error).message}`);
+      }
+    }
+
     // 如果有下一步提示，添加用户消息
     if (this.nextStepPrompt) {
       const userMsg = Message.userMessage(this.nextStepPrompt);
@@ -1319,6 +1333,18 @@ export class Manus extends ToolCallAgent {
     }
 
     try {
+      // 更新系统提示词，包含任务和计划信息
+      const currentTask = this.taskManager.getCurrentTask();
+      if (currentTask) {
+        try {
+          const planPrompt = await this.buildTaskAwarePromptWithContext(currentTask);
+          this.systemPrompt = this.systemPrompt + '\n' + planPrompt;
+          this.logger.info('已更新系统提示词，包含任务和计划信息');
+        } catch (error) {
+          this.logger.warn(`更新系统提示词失败: ${(error as Error).message}`);
+        }
+      }
+
       // 获取当前查询用于上下文获取
       const currentQuery = this.extractCurrentQuery();
 
@@ -1487,11 +1513,35 @@ export class Manus extends ToolCallAgent {
       }
       prompt += `计划进度: ${planProgress.completedSteps}/${planProgress.totalSteps} (${planProgress.progress.toFixed(1)}%)\n`;
 
+      // 添加计划创建时间和最后更新时间
+      if (currentPlan.createdAt) {
+        prompt += `计划创建时间: ${new Date(currentPlan.createdAt).toLocaleString()}\n`;
+      }
+      if (currentPlan.updatedAt) {
+        prompt += `计划最后更新: ${new Date(currentPlan.updatedAt).toLocaleString()}\n`;
+      }
+
+      // 添加当前计划步骤详细信息
       if (currentPlanStep) {
-        prompt += `当前计划步骤: ${currentPlanStep.description}\n`;
+        prompt += `\n当前计划步骤: ${currentPlanStep.description}\n`;
         prompt += `步骤状态: ${currentPlanStep.status}\n`;
         if (currentPlanStep.notes) {
           prompt += `步骤备注: ${currentPlanStep.notes}\n`;
+        }
+        if (currentPlanStep.startTime) {
+          prompt += `步骤开始时间: ${new Date(currentPlanStep.startTime).toLocaleString()}\n`;
+        }
+      }
+
+      // 显示已完成的步骤
+      const completedSteps = currentPlan.steps.filter((step) => step.status === 'completed');
+      if (completedSteps.length > 0) {
+        prompt += `\n已完成的步骤:\n`;
+        completedSteps.slice(-3).forEach((step, index) => {
+          prompt += `✓ ${step.description}\n`;
+        });
+        if (completedSteps.length > 3) {
+          prompt += `... 以及其他 ${completedSteps.length - 3} 个已完成步骤\n`;
         }
       }
 
@@ -1501,10 +1551,16 @@ export class Manus extends ToolCallAgent {
         planProgress.currentStepIndex + 3
       );
       if (nextSteps.length > 0) {
-        prompt += `接下来的计划步骤:\n`;
+        prompt += `\n接下来的计划步骤:\n`;
         nextSteps.forEach((step, index) => {
           prompt += `${planProgress.currentStepIndex + index + 2}. ${step.description}\n`;
         });
+      }
+
+      // 添加最近的planning工具调用结果
+      const latestPlanningResult = this.taskManager.getTaskContext('latest_planning_result');
+      if (latestPlanningResult) {
+        prompt += `\n最近的计划操作: ${latestPlanningResult.command} (${new Date(latestPlanningResult.timestamp).toLocaleString()})\n`;
       }
     }
 
@@ -1745,6 +1801,35 @@ export class Manus extends ToolCallAgent {
           toolArgs
         );
 
+        // 特殊处理planning工具调用结果，保存到任务上下文
+        if (toolName === 'planning') {
+          const currentTask = this.taskManager.getCurrentTask();
+          if (currentTask) {
+            // 保存planning工具调用结果到任务上下文
+            this.taskManager.setTaskContext('latest_planning_result', {
+              command: toolArgs.command,
+              result: result,
+              timestamp: Date.now(),
+            });
+
+            // 如果是获取计划，更新系统提示词
+            if (
+              toolArgs.command === 'get' ||
+              toolArgs.command === 'create' ||
+              toolArgs.command === 'update' ||
+              toolArgs.command === 'mark_step'
+            ) {
+              // 获取最新计划并更新上下文
+              const currentPlan = this.planManager.getCurrentPlan();
+              if (currentPlan) {
+                const planPrompt = await this.buildTaskAwarePromptWithContext(currentTask);
+                this.systemPrompt = this.systemPrompt + '\n' + planPrompt;
+                this.logger.info('已更新系统提示词，包含最新计划信息');
+              }
+            }
+          }
+        }
+
         return `MCP工具 \`${toolName}\` 执行完成 (服务: ${mcpTool.serviceName}):\n${this.formatToolResult(result)}`;
       }
 
@@ -1764,6 +1849,35 @@ export class Manus extends ToolCallAgent {
 
         if (!routerResult.success) {
           throw new Error(routerResult.error || '工具路由执行失败');
+        }
+
+        // 特殊处理planning工具调用结果，保存到任务上下文
+        if (toolName === 'planning') {
+          const currentTask = this.taskManager.getCurrentTask();
+          if (currentTask) {
+            // 保存planning工具调用结果到任务上下文
+            this.taskManager.setTaskContext('latest_planning_result', {
+              command: toolArgs.command,
+              result: routerResult.result,
+              timestamp: Date.now(),
+            });
+
+            // 如果是获取计划，更新系统提示词
+            if (
+              toolArgs.command === 'get' ||
+              toolArgs.command === 'create' ||
+              toolArgs.command === 'update' ||
+              toolArgs.command === 'mark_step'
+            ) {
+              // 获取最新计划并更新上下文
+              const currentPlan = this.planManager.getCurrentPlan();
+              if (currentPlan) {
+                const planPrompt = await this.buildTaskAwarePromptWithContext(currentTask);
+                this.systemPrompt = this.systemPrompt + '\n' + planPrompt;
+                this.logger.info('已更新系统提示词，包含最新计划信息');
+              }
+            }
+          }
         }
 
         return `工具 \`${toolName}\` 执行完成 (由 ${routerResult.executedBy} 执行):\n${this.formatToolResult(routerResult.result)}`;
@@ -1824,6 +1938,28 @@ export class Manus extends ToolCallAgent {
     // 记录工具执行结果到任务上下文
     if (currentTask) {
       this.taskManager.setTaskContext(`tool_${toolName}_result`, routerResult.result);
+
+      // 特殊处理planning工具调用
+      if (toolName === 'planning') {
+        // 保存planning工具调用结果到任务上下文
+        this.taskManager.setTaskContext('latest_planning_result', {
+          command: toolArgs.command,
+          result: routerResult.result,
+          timestamp: Date.now()
+        });
+
+        // 如果是获取计划，更新系统提示词
+        if (toolArgs.command === 'get' || toolArgs.command === 'create' ||
+            toolArgs.command === 'update' || toolArgs.command === 'mark_step') {
+          // 获取最新计划并更新上下文
+          const currentPlan = this.planManager.getCurrentPlan();
+          if (currentPlan) {
+            const planPrompt = await this.buildTaskAwarePromptWithContext(currentTask);
+            this.systemPrompt = this.systemPrompt + '\n' + planPrompt;
+            this.logger.info('已更新系统提示词，包含最新计划信息');
+          }
+        }
+      }
     }
 
     if (typeof commandOrName === 'string') {

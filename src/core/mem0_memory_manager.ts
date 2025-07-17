@@ -506,96 +506,170 @@ export class Mem0MemoryManager extends EventEmitter {
 
   /**
    * 智能压缩消息历史
-   * 根据相关性和重要性选择保留的消息，去除重复内容但保留跟踪信息
+   * 保留第一条和最后十条消息的原始信息，中间消息通过memory查询压缩
    */
   async getRelevantContext(currentQuery: string, allMessages: Message[]): Promise<Message[]> {
-    if (!this.isEnabled()) {
-      // 如果禁用记忆管理，返回最近的几条消息
+    if (!this.isEnabled() || allMessages.length <= 11) {
       return allMessages;
     }
 
     try {
-      // 搜索相关记忆
-      const relevantMemories = await this.searchMemories(currentQuery, this.config.searchLimit);
-
-      if (relevantMemories.length === 0) {
-        // 没有找到相关记忆，采用混合策略：取前5条和后面的maxContextMessages条
-        this.logger.debug('No relevant memories found, using hybrid message selection strategy');
-        return this.selectHybridMessages(allMessages);
-      }
-
-      // 构建上下文消息
       const contextMessages: Message[] = [];
 
-      // 用于去重的Set，基于消息内容和角色
-      const seenMessages = new Set<string>();
+      // 1. 保留第一条消息的原始信息
+      const firstMessage = allMessages[0];
+      contextMessages.push({ ...firstMessage }); // 使用展开运算符创建新对象，保持原始信息
 
-      // 辅助函数：生成消息的唯一标识（用于去重）
-      const getMessageKey = (msg: Message): string => {
-        return `${msg.role}:${msg.tool_call_id || 'no_tool'}${msg.content?.substring(0, 200) || ''}`;
-      };
+      // 2. 对中间消息进行处理
+      if (allMessages.length > 11) {
+        const middleMessages = allMessages.slice(1, -10);
 
-      // 辅助函数：安全添加消息（避免重复）
-      const addUniqueMessage = (msg: Message): void => {
-        const key = getMessageKey(msg);
-        if (!seenMessages.has(key)) {
-          seenMessages.add(key);
-          contextMessages.push(msg);
+        // 获取所有记忆的摘要信息
+        const allMemories = await this.getAllMemories();
+
+        // 搜索相关记忆
+        const relevantMemories = await this.searchMemories(currentQuery, this.config.searchLimit);
+
+        // 创建记忆摘要消息
+        if (allMemories.length > 0) {
+          // 将所有记忆转换为摘要
+          const memorySummary = {
+            role: Role.SYSTEM,
+            content: `[记忆摘要] 系统共有 ${allMemories.length} 条记忆。主要内容包括：${
+              allMemories.slice(0, 5).map(mem => mem.memory.substring(0, 50) + (mem.memory.length > 50 ? '...' : '')).join('; ')
+            }${allMemories.length > 5 ? ` 以及其他 ${allMemories.length - 5} 条记忆。` : ''}`
+          };
+          contextMessages.push(memorySummary);
         }
-      };
 
-      // 1. 首先添加系统消息（保持在最前面）
-      const systemMessages = allMessages.filter((msg) => msg.role === Role.SYSTEM);
-      systemMessages.forEach(addUniqueMessage);
+        if (relevantMemories.length > 0) {
+          // 将相关记忆转换为消息格式
+          const memoryMessages = relevantMemories.map((mem) => ({
+            role: Role.SYSTEM,
+            content: `[相关上下文] ${mem.memory}`,
+          }));
 
-      // 2. 添加第一条用户消息（最高优先级，永远放在第一位）
-      const firstUserMessage = allMessages.find((msg) => msg.role === Role.USER);
-      if (firstUserMessage) {
-        addUniqueMessage(firstUserMessage);
-        this.logger.debug('Added first user message with highest priority');
+          // 从中间消息中找出与当前任务相关的消息
+          const taskRelatedMessages = await this.findTaskRelatedMessages(
+            middleMessages,
+            currentQuery
+          );
+
+          // 添加相关消息
+          contextMessages.push(...memoryMessages);
+          contextMessages.push(...taskRelatedMessages);
+        }
       }
 
-      // 3. 添加相关记忆作为系统消息（如果有且不重复）
-      if (relevantMemories.length > 0) {
-        const memoryContext = relevantMemories
-          .map((mem, index) => `[记忆${index + 1}]: ${mem.memory}`)
-          .join('\n');
-        const memoryMessage = Message.systemMessage(
-          `=== 相关记忆上下文 ===\n${memoryContext}\n=== 记忆结束 ===`
-        );
-        addUniqueMessage(memoryMessage);
-      }
-
-      // 4. 添加最近的非系统消息（按时间顺序，避免重复）
-      const recentNonSystemMessages = allMessages
-        .filter((msg) => msg.role !== Role.SYSTEM)
-        .slice(-this.config.maxContextMessages);
-
-      recentNonSystemMessages.forEach(addUniqueMessage);
-
-      // 记录构建的上下文信息
-      const messageStats = {
-        total: contextMessages.length,
-        system: contextMessages.filter((msg) => msg.role === Role.SYSTEM).length,
-        user: contextMessages.filter((msg) => msg.role === Role.USER).length,
-        assistant: contextMessages.filter((msg) => msg.role === Role.ASSISTANT).length,
-        memories: relevantMemories.length,
-        originalTotal: allMessages.length,
-      };
+      // 3. 保留最后10条消息的原始信息
+      const lastTenMessages = allMessages.slice(-10).map((msg) => ({ ...msg })); // 使用展开运算符创建新对象，保持原始信息
+      contextMessages.push(...lastTenMessages);
 
       this.logger.info(
-        `Built deduplicated context: ${messageStats.total} messages ` +
-          `(${messageStats.system} system, ${messageStats.user} user, ${messageStats.assistant} assistant) ` +
-          `with ${messageStats.memories} memories from ${messageStats.originalTotal} original messages`
+        `压缩后的消息: 总数 ${contextMessages.length} (第一条原始消息 + ${
+          contextMessages.length - 11
+        } 条相关消息 + 最后10条原始消息)`
       );
 
       return contextMessages;
     } catch (error) {
-      this.logger.error(`Failed to get relevant context: ${error}`);
-      // 出错时也使用混合策略：取前5条和后面的maxContextMessages条
-      this.logger.debug('Error occurred, falling back to hybrid message selection strategy');
-      return this.selectHybridMessages(allMessages);
+      this.logger.error(`获取相关上下文失败: ${error}`);
+      // 出错时保留第一条和最后10条的原始信息
+      return [{ ...allMessages[0] }, ...allMessages.slice(-10).map((msg) => ({ ...msg }))];
     }
+  }
+
+  /**
+   * 从消息列表中找出与当前任务相关的消息
+   */
+  private async findTaskRelatedMessages(
+    messages: Message[],
+    currentQuery: string
+  ): Promise<Message[]> {
+    try {
+      // 构建搜索文本
+      const searchTexts = messages.map((msg) => {
+        let text = msg.content || '';
+        if (msg.tool_calls) {
+          text +=
+            ' ' +
+            msg.tool_calls
+              .map((call) => `${call.function.name} ${call.function.arguments}`)
+              .join(' ');
+        }
+        return text;
+      });
+
+      // 使用memory搜索相关内容
+      const searchResults = await Promise.all(
+        searchTexts.map(async (text, index) => {
+          try {
+            const similarity = await this.calculateSimilarity(text, currentQuery);
+            return { message: messages[index], similarity };
+          } catch {
+            return { message: messages[index], similarity: 0 };
+          }
+        })
+      );
+
+      // 按相关性排序并选择最相关的消息
+      const relatedMessages = searchResults
+        .filter((result) => result.similarity > 0.6) // 只保留相关性较高的消息
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, 5) // 最多保留5条相关消息
+        .map((result) => ({ ...result.message })); // 创建消息的副本
+
+      this.logger.debug(`找到 ${relatedMessages.length} 条相关消息 (相关性阈值 > 0.6)`);
+
+      return relatedMessages;
+    } catch (error) {
+      this.logger.error(`查找相关消息失败: ${error}`);
+      return [];
+    }
+  }
+
+  /**
+   * 计算两段文本的相似度
+   * 如果memory支持搜索相似度，则使用memory的方法
+   * 否则使用简单的关键词匹配
+   */
+  private async calculateSimilarity(text: string, query: string): Promise<number> {
+    // 尝试使用memory的搜索功能
+    if (this.memory && typeof this.memory.search === 'function') {
+      try {
+        const results = await this.memory.search(query, { limit: 1 });
+        if (results.results && results.results.length > 0) {
+          // 使用search结果的分数作为相似度参考
+          return results.results[0].score || 0;
+        }
+      } catch (e) {
+        // 忽略错误，继续使用简单匹配
+      }
+    }
+
+    // 简单关键词匹配算法
+    const textLower = text.toLowerCase();
+    const queryLower = query.toLowerCase();
+    const queryWords = queryLower.split(/\s+/).filter((w) => w.length > 2);
+
+    if (queryWords.length === 0) return 0;
+
+    let matchCount = 0;
+    for (const word of queryWords) {
+      if (textLower.includes(word)) {
+        matchCount++;
+        // 完全匹配加分
+        if (
+          textLower.includes(` ${word} `) ||
+          textLower.startsWith(word) ||
+          textLower.endsWith(word)
+        ) {
+          matchCount += 0.5;
+        }
+      }
+    }
+
+    return Math.min(matchCount / queryWords.length, 1.0);
   }
 
   /**
@@ -768,10 +842,10 @@ export class Mem0MemoryManager extends EventEmitter {
   /**
    * 混合消息选择策略：取前5条和后面的maxContextMessages条
    * 用于在没有相关记忆或出错时的回退方案
-   * 确保第一条用户消息始终具有最高优先级
+   * 确保第一条用户消息始终具有最高优先级，并且保留最近的消息
    */
   private selectHybridMessages(allMessages: Message[]): Message[] {
-    const maxContext = this.config.maxContextMessages;
+    const maxContext = Math.max(5, this.config.maxContextMessages);
 
     if (allMessages.length <= maxContext) {
       // 如果总消息数不超过maxContext，返回所有消息
@@ -795,6 +869,7 @@ export class Mem0MemoryManager extends EventEmitter {
         priorityMessages.push(msg);
         return true;
       }
+      console.log('🚀🚀🚀🚀🚀🚀 ~ Mem0MemoryManager ~ addUniqueMessage ~ msg:', msg);
       return false;
     };
 
@@ -814,18 +889,22 @@ export class Mem0MemoryManager extends EventEmitter {
     const prefixMessages = allMessages.slice(0, prefixCount);
     prefixMessages.forEach(addUniqueMessage);
 
-    // 4. 计算剩余可用的消息数量
-    const remainingSlots = maxContext - priorityMessages.length;
+    // 4. 确保添加最近的5条消息
+    const lastFiveMessages = allMessages.slice(-5);
+    lastFiveMessages.forEach(addUniqueMessage);
 
+    // 5. 如果还有剩余空间，添加中间的消息
+    const remainingSlots = maxContext - priorityMessages.length;
     if (remainingSlots > 0) {
-      // 取最后的remainingSlots条消息
-      const suffixMessages = allMessages.slice(-remainingSlots);
-      suffixMessages.forEach(addUniqueMessage);
+      const middleMessages = allMessages.slice(prefixCount, -5);
+      const step = Math.ceil(middleMessages.length / remainingSlots);
+      for (let i = 0; i < middleMessages.length; i += step) {
+        addUniqueMessage(middleMessages[i]);
+      }
     }
 
     this.logger.debug(
-      `Hybrid strategy: ${priorityMessages.length} total messages ` +
-        `(${systemMessages.length} system, first user message priority, remaining context)`
+      `Hybrid strategy selected ${priorityMessages.length} messages (including last 5) from ${allMessages.length} total`
     );
 
     return priorityMessages;

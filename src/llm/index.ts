@@ -262,10 +262,7 @@ export class LLM {
     const llmConfig = config.getLLMConfig(this.configName);
     this.logger.info(`🚀 开始LLM调用 - 模型: ${llmConfig.model}, 配置: ${this.configName}`);
     this.logger.info(
-      `📝 输入消息数量: ${options.messages.length}, 系统消息数量: ${options.systemMsgs?.length || 0}`
-    );
-    this.logger.info(
-      `🛠️ 工具数量: ${options.tools?.length || 0}, 工具选择模式: ${options.toolChoice || 'auto'}`
+      `🛠️ 工具数量: ${options.tools?.length || 0}, 工具选择模式: ${options.toolChoice || 'required'}`
     );
 
     // 打印第一条和最后一条消息的摘要
@@ -274,7 +271,7 @@ export class LLM {
       const lastMsg = options.messages[options.messages.length - 1];
 
       this.logger.info(
-        `📤 最后一条消息: ${lastMsg.role} - ${(lastMsg.content || '').substring(0, 100)}${(lastMsg.content || '').length > 100 ? '...' : ''}`
+        `📤 最后一条消息: ${lastMsg.role} - ${(lastMsg.content || '').substring(0, 300)}${(lastMsg.content || '').length > 100 ? '...' : ''}`
       );
     }
 
@@ -325,9 +322,6 @@ export class LLM {
 
         // 打印请求参数
         this.logger.info(`📡 发送LLM请求 - 尝试次数: ${attempt + 1}`);
-        this.logger.info(
-          `🔧 请求参数: model=${llmConfig.model}, temperature=${llmConfig.temperature}, max_tokens=${llmConfig.max_tokens}`
-        );
 
         // 发送请求
         const response = await this.client.chat.completions.create({
@@ -346,11 +340,6 @@ export class LLM {
         };
 
         const executionTime = Date.now() - startTime;
-
-        // 打印响应结果
-        this.logger.info(`✅ LLM调用成功 - 执行时间: ${executionTime}ms`);
-        this.logger.info(`📄 响应内容长度: ${(llmResponse.content || '').length} 字符`);
-        this.logger.info(`🛠️ 工具调用数量: ${llmResponse.tool_calls?.length || 0}`);
 
         if (llmResponse.tool_calls && llmResponse.tool_calls.length > 0) {
           this.logger.info(

@@ -134,6 +134,7 @@ export class Message {
 export class Memory {
   messages: Message[] = [];
   private addedToolResults: Set<string> = new Set();
+  private readonly MIN_MESSAGES = 5; // 最少保留的消息数量
 
   /**
    * 添加消息到内存
@@ -154,10 +155,21 @@ export class Memory {
   }
 
   /**
-   * 清空内存
+   * 清空内存，但保留最近的消息
    */
   clear(): void {
-    this.messages = [];
+    if (this.messages.length > this.MIN_MESSAGES) {
+      // 保留最后MIN_MESSAGES条消息
+      this.messages = this.messages.slice(-this.MIN_MESSAGES);
+      console.log(`🔄 清理内存但保留最近 ${this.MIN_MESSAGES} 条消息`);
+    }
     this.addedToolResults.clear();
+  }
+
+  /**
+   * 获取消息列表，确保至少包含最近的消息
+   */
+  getMessages(): Message[] {
+    return this.messages;
   }
 }
