@@ -837,7 +837,7 @@ export class Manus extends ToolCallAgent {
       maxSteps: options.maxSteps || 30,
       llmConfigName: options.llmConfigName || 'default',
       tools: options.tools || new ToolCollection(),
-      toolChoice: ToolChoice.AUTO,
+      toolChoice: ToolChoice.REQUIRED,
       specialToolNames: ['Terminate'],
     });
 
@@ -1221,8 +1221,7 @@ export class Manus extends ToolCallAgent {
   async think(): Promise<boolean> {
     this.logger.info(`🤔 Manus 开始多智能体思考过程`);
 
-    const currentPlan = this.planManager.getCurrentPlan();
-
+    // const currentPlan = this.planManager.getCurrentPlan();
     // 更新系统提示词，包含任务和计划信息
     const currentTask = this.taskManager.getCurrentTask();
     if (currentTask) {
@@ -1302,6 +1301,9 @@ export class Manus extends ToolCallAgent {
       toolChoice: toolChoice,
       currentQuery: currentQuery,
     });
+
+    // 保存对话到记忆系统
+    await this.saveConversationToMemory(contextualMessages, response);
 
     if (response.tool_calls && response.tool_calls.length > 0) {
       this.toolCalls = response.tool_calls;

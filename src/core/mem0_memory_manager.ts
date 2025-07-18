@@ -508,9 +508,20 @@ export class Mem0MemoryManager extends EventEmitter {
    * 智能压缩消息历史
    * 保留第一条和最后十条消息的原始信息，中间消息通过memory查询压缩
    */
-  async getRelevantContext(currentQuery: string, allMessages: Message[]): Promise<Message[]> {
-    if (!this.isEnabled() || allMessages.length <= 11) {
-      return allMessages;
+  async getRelevantContext(currentQuery: string, _allMessages: Message[]): Promise<Message[]> {
+    const allMessages = _allMessages.filter(
+      (msg) =>
+        !(
+          msg.role === Role.USER &&
+          msg.content === '请分析当前任务状态，思考下一步应该做什么，并使用适当的工具来完成任务。'
+        )
+    );
+    allMessages.push({
+      role: Role.USER,
+      content: '请分析当前任务状态，思考下一步应该做什么，并使用适当的工具来完成任务。',
+    });
+    if (!this.isEnabled() || _allMessages.length <= 11) {
+      return _allMessages;
     }
 
     try {
@@ -526,28 +537,29 @@ export class Mem0MemoryManager extends EventEmitter {
 
         // 获取所有记忆的摘要信息
         const allMemories = await this.getAllMemories();
-
         // 搜索相关记忆
         const relevantMemories = await this.searchMemories(currentQuery, this.config.searchLimit);
-
         // 创建记忆摘要消息
         if (allMemories.length > 0) {
           // 将所有记忆转换为摘要
           const memorySummary = {
             role: Role.SYSTEM,
-            content: `[记忆摘要] 系统共有 ${allMemories.length} 条记忆。主要内容包括：${
-              allMemories.slice(0, 5).map(mem => mem.memory.substring(0, 50) + (mem.memory.length > 50 ? '...' : '')).join('; ')
-            }${allMemories.length > 5 ? ` 以及其他 ${allMemories.length - 5} 条记忆。` : ''}`
+            content: `[记忆摘要] 系统共有 ${allMemories.length} 条记忆。主要内容包括：${allMemories
+              .slice(0, 5)
+              .map((mem) => mem.memory.substring(0, 50) + (mem.memory.length > 50 ? '...' : ''))
+              .join(
+                '; '
+              )}${allMemories.length > 5 ? ` 以及其他 ${allMemories.length - 5} 条记忆。` : ''}`,
           };
           contextMessages.push(memorySummary);
         }
 
         if (relevantMemories.length > 0) {
           // 将相关记忆转换为消息格式
-          const memoryMessages = relevantMemories.map((mem) => ({
-            role: Role.SYSTEM,
-            content: `[相关上下文] ${mem.memory}`,
-          }));
+          // const memoryMessages = relevantMemories.map((mem) => ({
+          //   role: Role.SYSTEM,
+          //   content: `[相关上下文] ${mem.memory}`,
+          // }));
 
           // 从中间消息中找出与当前任务相关的消息
           const taskRelatedMessages = await this.findTaskRelatedMessages(
@@ -556,7 +568,10 @@ export class Mem0MemoryManager extends EventEmitter {
           );
 
           // 添加相关消息
-          contextMessages.push(...memoryMessages);
+          contextMessages.push({
+            role: Role.SYSTEM,
+            content: `[相关上下文] ${relevantMemories.map((mem) => mem.memory.substring(0, 50)).join('; ')}`,
+          });
           contextMessages.push(...taskRelatedMessages);
         }
       }
@@ -869,7 +884,6 @@ export class Mem0MemoryManager extends EventEmitter {
         priorityMessages.push(msg);
         return true;
       }
-      console.log('🚀🚀🚀🚀🚀🚀 ~ Mem0MemoryManager ~ addUniqueMessage ~ msg:', msg);
       return false;
     };
 
